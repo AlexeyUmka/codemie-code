@@ -269,12 +269,7 @@ export const CodeMieCodePluginMetadata: AgentMetadata = {
 
       // Fetch live model catalogue from the CodeMie API.
       // Falls back to the static OPENCODE_MODEL_CONFIGS on any error.
-      const allModels = await fetchDynamicModelConfigs(
-        baseUrl,
-        env.CODEMIE_URL,
-        env.CODEMIE_JWT_TOKEN,
-        selectedModel,
-      );
+      const allModels = await fetchDynamicModelConfigs(baseUrl, env, selectedModel);
 
       // Use dynamic catalogue first, then fall back to static getModelConfig for unknown IDs.
       const modelConfig = allModels[selectedModel] ?? getModelConfig(selectedModel);
