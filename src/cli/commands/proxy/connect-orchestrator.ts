@@ -251,9 +251,8 @@ export async function resolveSsoProxyConfig(
 
 export async function verifySsoCredentials(baseUrl: string, profileName: string): Promise<void> {
   try {
-    const { CodeMieSSO } = await import('../../../providers/plugins/sso/sso.auth.js');
-    const sso = new CodeMieSSO();
-    const creds = await sso.getStoredCredentials(baseUrl);
+    const { getStoredPlatformCredentials } = await import('../../../providers/core/codemie-auth-helpers.js');
+    const creds = await getStoredPlatformCredentials({ provider: 'ai-run-sso', baseUrl });
     if (!creds) {
       console.error(chalk.red(`✗ No SSO credentials found for profile '${profileName}'.`));
       console.error(`  Run: codemie profile login --url ${baseUrl}`);
