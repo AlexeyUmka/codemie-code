@@ -69,7 +69,7 @@ describe('profile auth commands', () => {
 
     it('refreshes the URL that actually holds the credentials (split host)', async () => {
       mockConfigLoad.mockResolvedValue({ provider: 'ai-run-sso', baseUrl: P, codeMieUrl: W });
-      mockGetStoredCredentials.mockResolvedValueOnce(null).mockResolvedValueOnce({ cookies: {}, apiUrl: W });
+      mockGetStoredCredentials.mockResolvedValueOnce(null).mockResolvedValueOnce({ cookies: {}, apiUrl: `${P}/code-assistant-api` });
       await run(createRefreshCommand());
       expect(mockClearStoredCredentials).toHaveBeenCalledWith(W);
       expect(mockAuthenticate).toHaveBeenCalledWith({ codeMieUrl: W, timeout: 120000 });
@@ -97,10 +97,11 @@ describe('profile auth commands', () => {
   });
 
   describe('logout', () => {
-    it('clears credentials under every candidate URL', async () => {
+    it('clears only the URL that holds the credentials', async () => {
       mockConfigLoad.mockResolvedValue({ provider: 'ai-run-sso', baseUrl: P, codeMieUrl: W });
+      mockGetStoredCredentials.mockResolvedValueOnce({ cookies: {}, apiUrl: `${P}/code-assistant-api` });
       await run(createLogoutCommand());
-      expect(mockClearStoredCredentials.mock.calls.map(c => c[0])).toEqual([P, W]);
+      expect(mockClearStoredCredentials.mock.calls.map(c => c[0])).toEqual([P]);
     });
 
     it('clears the baseUrl of a baseUrl-only profile', async () => {

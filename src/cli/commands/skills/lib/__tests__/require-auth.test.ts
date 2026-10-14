@@ -36,7 +36,7 @@ describe('requireAuthenticatedSession', () => {
 
   it('falls back to codeMieUrl when the baseUrl lookup misses', async () => {
     mockConfigLoad.mockResolvedValue({ provider: 'ai-run-sso', baseUrl: P, codeMieUrl: W });
-    mockGetStoredCredentials.mockResolvedValueOnce(null).mockResolvedValueOnce({ cookies: { s: '1' }, apiUrl: W });
+    mockGetStoredCredentials.mockResolvedValueOnce(null).mockResolvedValueOnce({ cookies: { s: '1' }, apiUrl: `${P}/code-assistant-api` });
 
     await expect(requireAuthenticatedSession()).resolves.toBe(true);
     expect(mockGetStoredCredentials.mock.calls.map(c => c[0])).toEqual([P, W]);

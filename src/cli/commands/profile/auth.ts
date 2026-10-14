@@ -7,7 +7,6 @@ import { ProviderRegistry } from '../../../providers/core/registry.js';
 import { logger } from '../../../utils/logger.js';
 import {
   getPlatformUrl,
-  getPlatformUrlCandidates,
   getStoredPlatformCredentials
 } from '../../../providers/core/codemie-auth-helpers.js';
 
@@ -108,17 +107,12 @@ async function handleLogout(): Promise<void> {
 
   try {
     const config = await ConfigLoader.load();
-    const candidates = getPlatformUrlCandidates(config);
-
-    // Clear every candidate so logout works regardless of which URL holds the
-    // credentials (clearing is idempotent). With no URL, clear the default slot.
+    // Clear only the URL that holds this profile's credentials, so logging out of
+    // one environment never wipes the login of another. With no URL, clear the
+    // default slot.
     const sso = new CodeMieSSO();
-    if (candidates.length === 0) {
-      await sso.clearStoredCredentials(undefined);
-    }
-    for (const candidate of candidates) {
-      await sso.clearStoredCredentials(candidate);
-    }
+    const found = await getStoredPlatformCredentials(config);
+    await sso.clearStoredCredentials(found?.url ?? getPlatformUrl(config));
 
     spinner.succeed(chalk.green('Successfully logged out'));
     console.log(chalk.white('SSO credentials have been cleared'));

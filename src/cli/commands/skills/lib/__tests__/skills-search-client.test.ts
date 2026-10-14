@@ -231,7 +231,10 @@ describe('searchInternal', () => {
       baseUrl: 'https://profile.example.com',
       codeMieUrl: 'https://workspace.example.com',
     });
-    mockGetStoredCredentials.mockResolvedValueOnce(null).mockResolvedValueOnce({ cookies: { session: 'w' } });
+    mockGetStoredCredentials.mockResolvedValueOnce(null).mockResolvedValueOnce({
+      cookies: { session: 'w' },
+      apiUrl: 'https://profile.example.com/code-assistant-api',
+    });
 
     const { searchInternal } = await importClient();
     await searchInternal('q', 10);

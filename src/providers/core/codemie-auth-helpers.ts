@@ -5,6 +5,7 @@ import type { SSOAuthResult, SSOCredentials } from './types.js';
 import { ProviderName } from './types.js';
 import { ConfigurationError } from '../../utils/errors.js';
 import { isTlsVerificationEnabled } from '../../utils/system-proxy.js';
+import { logger } from '../../utils/logger.js';
 
 export const DEFAULT_CODEMIE_BASE_URL = 'https://codemie.lab.epam.com';
 
@@ -114,6 +115,19 @@ function originOf(url: string): string {
   }
 }
 
+function isCodeMiePlatformProvider(provider: string | undefined): boolean {
+  return provider === ProviderName.AI_RUN_SSO || provider === ProviderName.BEARER_AUTH;
+}
+
+function isLoopbackUrl(url: string): boolean {
+  try {
+    const host = new URL(url).hostname;
+    return host === 'localhost' || host === '127.0.0.1' || host === '[::1]' || host === '::1';
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Ordered platform URL candidates: profile baseUrl (P) first, workspace
  * codeMieUrl (W) as fallback. Only CodeMie providers (ai-run-sso, bearer-auth)
@@ -122,8 +136,7 @@ function originOf(url: string): string {
  * host-only, so a same-origin retry would return the identical result.
  */
 export function getPlatformUrlCandidates(src: PlatformUrlSource): string[] {
-  const isCodeMieProvider =
-    src.provider === ProviderName.AI_RUN_SSO || src.provider === ProviderName.BEARER_AUTH;
+  const isCodeMieProvider = isCodeMiePlatformProvider(src.provider);
   const raw = isCodeMieProvider ? [src.baseUrl, src.codeMieUrl] : [src.codeMieUrl];
 
   const seen = new Set<string>();
@@ -167,13 +180,41 @@ export function getPlatformUrlFromEnv(env: NodeJS.ProcessEnv): string | undefine
   return getPlatformUrlCandidatesFromEnv(env)[0];
 }
 
-async function lookupStoredCredentials(candidates: string[]): Promise<PlatformCredentials | null> {
+/**
+ * Try each candidate in order. The workspace codeMieUrl is a single value shared
+ * by all profiles, so it can point at a different environment than the active
+ * profile. A credential found under a fallback candidate is therefore accepted
+ * only if it was issued for the profile's own API host (credentials.apiUrl);
+ * otherwise a dev login would be used for a prod profile. Loopback baseUrls are
+ * exempt: inside an agent session baseUrl may be the local proxy URL.
+ */
+async function lookupStoredCredentials(src: PlatformUrlSource): Promise<PlatformCredentials | null> {
+  const candidates = getPlatformUrlCandidates(src);
   if (candidates.length === 0) return null;
+
+  const profileOrigin =
+    isCodeMiePlatformProvider(src.provider) && src.baseUrl && !isLoopbackUrl(src.baseUrl)
+      ? originOf(src.baseUrl)
+      : undefined;
+
   const { CodeMieSSO } = await import('../plugins/sso/sso.auth.js');
   const sso = new CodeMieSSO();
   for (const url of candidates) {
     const credentials = await sso.getStoredCredentials(url);
-    if (credentials) return { credentials, url };
+    if (!credentials) continue;
+
+    if (
+      profileOrigin &&
+      originOf(url) !== profileOrigin &&
+      (!credentials.apiUrl || originOf(credentials.apiUrl) !== profileOrigin)
+    ) {
+      logger.debug('[auth] Ignoring stored credentials issued for a different host than the profile URL', {
+        profileOrigin,
+        credentialsUrl: url,
+      });
+      continue;
+    }
+    return { credentials, url };
   }
   return null;
 }
@@ -186,13 +227,13 @@ async function lookupStoredCredentials(candidates: string[]): Promise<PlatformCr
 export async function getStoredPlatformCredentials(
   src: PlatformUrlSource
 ): Promise<PlatformCredentials | null> {
-  return lookupStoredCredentials(getPlatformUrlCandidates(src));
+  return lookupStoredCredentials(src);
 }
 
 export async function getStoredPlatformCredentialsFromEnv(
   env: NodeJS.ProcessEnv
 ): Promise<PlatformCredentials | null> {
-  return lookupStoredCredentials(getPlatformUrlCandidatesFromEnv(env));
+  return lookupStoredCredentials(platformSourceFromEnv(env));
 }
 
 /* eslint-disable no-redeclare */
