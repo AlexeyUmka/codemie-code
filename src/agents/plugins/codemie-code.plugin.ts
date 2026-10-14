@@ -65,6 +65,7 @@ function buildHookConfig(env: NodeJS.ProcessEnv, sessionId: string): HookProcess
     provider: env.CODEMIE_PROVIDER,
     apiBaseUrl: env.CODEMIE_BASE_URL,
     ssoUrl: env.CODEMIE_URL,
+    env,
     version: env.CODEMIE_CLI_VERSION,
     profileName: env.CODEMIE_PROFILE_NAME,
     project: env.CODEMIE_PROJECT,

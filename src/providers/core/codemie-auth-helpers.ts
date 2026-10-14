@@ -236,6 +236,37 @@ export async function getStoredPlatformCredentialsFromEnv(
   return lookupStoredCredentials(platformSourceFromEnv(env));
 }
 
+/**
+ * Platform source for analytics/hook flows: the active profile (provider +
+ * baseUrl from CODEMIE_PROFILE_CONFIG) with `ssoUrl` (the workspace
+ * CODEMIE_URL) as fallback. Explicit `provider`/`baseUrl` win over the env.
+ */
+export function getAnalyticsPlatformSource(
+  ssoUrl: string | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+  overrides: { provider?: string; baseUrl?: string } = {}
+): PlatformUrlSource {
+  const fromEnv = platformSourceFromEnv(env);
+  return {
+    provider: overrides.provider ?? fromEnv.provider,
+    baseUrl: overrides.baseUrl ?? fromEnv.baseUrl,
+    codeMieUrl: ssoUrl ?? fromEnv.codeMieUrl,
+  };
+}
+
+/**
+ * Stored login for analytics, session sync and hook auth checks. Same
+ * profile-first lookup as model/chat traffic, so switching to a prod profile
+ * never depends on (or re-authenticates against) the workspace environment.
+ */
+export async function getStoredAnalyticsCredentials(
+  ssoUrl: string | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+  overrides: { provider?: string; baseUrl?: string } = {}
+): Promise<PlatformCredentials | null> {
+  return lookupStoredCredentials(getAnalyticsPlatformSource(ssoUrl, env, overrides));
+}
+
 /* eslint-disable no-redeclare */
 export function fetchCodeMieUserInfo(
   apiUrl: string,

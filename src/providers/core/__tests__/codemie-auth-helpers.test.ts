@@ -35,6 +35,7 @@ import {
   getPlatformUrlCandidatesFromEnv,
   getStoredPlatformCredentials,
   getStoredPlatformCredentialsFromEnv,
+  getStoredAnalyticsCredentials,
 } from '../codemie-auth-helpers.js';
 
 describe('ensureApiBase', () => {
@@ -453,5 +454,53 @@ describe('getStoredPlatformCredentials', () => {
     const env = { CODEMIE_PROFILE_CONFIG: JSON.stringify({ provider: 'ai-run-sso', baseUrl: P }) } as NodeJS.ProcessEnv;
     const result = await getStoredPlatformCredentialsFromEnv(env);
     expect(result).toEqual({ credentials: creds, url: P });
+  });
+});
+
+describe('getStoredAnalyticsCredentials', () => {
+  const P = 'https://prod.example.com';
+  const W = 'https://preview.example.com';
+  const prodCreds = { cookies: { a: 'prod' }, apiUrl: `${P}/code-assistant-api` };
+  const previewCreds = { cookies: { a: 'preview' }, apiUrl: `${W}/code-assistant-api` };
+  const profileEnv = (provider = 'ai-run-sso') =>
+    ({ CODEMIE_PROFILE_CONFIG: JSON.stringify({ provider, baseUrl: P }) }) as NodeJS.ProcessEnv;
+
+  beforeEach(() => {
+    mockGetStoredCredentials.mockReset();
+  });
+
+  it('uses the profile login without touching the workspace login', async () => {
+    mockGetStoredCredentials.mockResolvedValueOnce(prodCreds);
+    const result = await getStoredAnalyticsCredentials(W, profileEnv());
+    expect(result).toEqual({ credentials: prodCreds, url: P });
+    expect(mockGetStoredCredentials).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not borrow another environment\'s workspace login for the profile', async () => {
+    mockGetStoredCredentials.mockImplementation(async (url: string) => (url === W ? previewCreds : null));
+    const result = await getStoredAnalyticsCredentials(W, profileEnv());
+    expect(result).toBeNull();
+  });
+
+  it('accepts a workspace-stored login issued for the profile host (split host)', async () => {
+    mockGetStoredCredentials.mockImplementation(async (url: string) => (url === W ? prodCreds : null));
+    const result = await getStoredAnalyticsCredentials(W, profileEnv());
+    expect(result).toEqual({ credentials: prodCreds, url: W });
+  });
+
+  it('prefers explicit provider/baseUrl over the env', async () => {
+    mockGetStoredCredentials.mockResolvedValueOnce(prodCreds);
+    const result = await getStoredAnalyticsCredentials(W, {} as NodeJS.ProcessEnv, {
+      provider: 'ai-run-sso',
+      baseUrl: P,
+    });
+    expect(result?.url).toBe(P);
+  });
+
+  it('stays workspace-only for non-CodeMie providers', async () => {
+    mockGetStoredCredentials.mockResolvedValue(previewCreds);
+    const result = await getStoredAnalyticsCredentials(W, profileEnv('anthropic-subscription'));
+    expect(result).toEqual({ credentials: previewCreds, url: W });
+    expect(mockGetStoredCredentials.mock.calls.map(c => c[0])).toEqual([W]);
   });
 });
