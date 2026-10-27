@@ -240,6 +240,7 @@ export function convertLlmModelToPiEntry(model: LlmModel): PiModelEntry {
   return entry;
 }
 
+// Pi validates provider `compat` against a strict schema; an unknown `thinkingFormat` literal makes Pi drop the whole file.
 interface PiModelsConfig {
   providers: Record<string, {
     baseUrl: string;
@@ -299,7 +300,6 @@ function buildModelsConfig(
       apiKey,
       compat: {
         supportsReasoningEffort: true,
-        thinkingFormat: 'reasoning_effort',
       },
       models: proxyModels,
     };
@@ -313,7 +313,6 @@ function buildModelsConfig(
       authHeader: true,
       compat: {
         supportsReasoningEffort: true,
-        thinkingFormat: 'reasoning_effort',
       },
       models: anthropicModels,
     };
@@ -387,7 +386,6 @@ async function buildOllamaModelsConfig(env: NodeJS.ProcessEnv): Promise<PiModels
         apiKey,
         compat: {
           supportsReasoningEffort: true,
-          thinkingFormat: 'reasoning_effort',
         },
         models: ids.map(id => convertLlmModelToPiEntry(createSyntheticLlmModel(id))),
       },
