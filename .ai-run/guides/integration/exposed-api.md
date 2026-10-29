@@ -182,6 +182,24 @@ Multi-provider (v2): `{ version: 2, activeProfile: string, profiles: Record<stri
 
 ---
 
+## CLI entry: unattended scheduled runs
+
+`bin/codemie.js`, the CLI entry script, detects one invocation shape and skips its normal
+interactive startup for it: `<node> <realpath of bin/codemie.js> analytics sync run
+--scheduled`, the command the `codemie analytics sync install` OS job (launchd/systemd
+user timer/Task Scheduler) always runs. Detection (`isScheduledSyncRun`,
+`src/utils/scheduled-run.ts:20`) is a pure `argv` check: the contiguous tokens `analytics`,
+`sync`, `run`, with `--scheduled` anywhere after `run`.
+
+When detected, `bin/codemie.js` runs pending migrations with `silent: true`, and skips the
+CLI update check/prompt and the once-per-upgrade "what's new" notice — the job has no
+terminal and no user to notify. A manual `codemie analytics sync run` (no `--scheduled`)
+keeps today's normal interactive startup. See
+[ANALYTICS-REPORT.md](../../../docs/ANALYTICS-REPORT.md#scheduled-delivery-analytics-sync)
+for the full `sync` command surface.
+
+---
+
 ## Error Handling Reference
 
 | Surface | Error type | Handling |
