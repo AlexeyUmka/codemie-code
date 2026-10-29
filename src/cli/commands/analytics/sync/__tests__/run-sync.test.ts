@@ -1,12 +1,9 @@
-import { mkdtemp, rm } from 'fs/promises';
-import { tmpdir } from 'os';
-import { join } from 'path';
 import { describe, expect, it, vi } from 'vitest';
 
-import { SyncDeliveryError, SyncIdentityMissingError } from '@/utils/errors.js';
+import { ExportTooLargeError, SyncIdentityMissingError } from '@/utils/errors.js';
 
 import { runSync } from '../run-sync.js';
-import type { SyncDeliveryTarget, SyncDeps } from '../run-sync.js';
+import type { SyncDeps } from '../run-sync.js';
 import type { SyncReport, SyncSettings } from '../types.js';
 import type { AnalyticsSource } from '../../sources/types.js';
 
@@ -14,7 +11,10 @@ const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
 
 const NOW = new Date('2026-10-29T00:00:00.000Z');
-const REPORT: SyncReport = { fileName: 'report.json', bytes: Buffer.from('{"a":1}') };
+const REPORT: SyncReport = {
+  fileName: 'codemie-analytics-jane.doe-2026-10-29.report.json',
+  bytes: Buffer.from('{"a":1}'),
+};
 
 const BASE_SETTINGS: SyncSettings = {
   webhookUrl: 'https://example.invalid/hook?sig=FAKE',
@@ -22,19 +22,6 @@ const BASE_SETTINGS: SyncSettings = {
   at: '03:00',
   lookbackDays: 7,
 };
-
-function fakeTarget(deliver: (report: SyncReport) => Promise<void>): SyncDeliveryTarget {
-  return { deliver };
-}
-
-/** Real temp dir/removal so the (non-injected) report write in `runSync` lands somewhere real. */
-async function realMakeTempDir(): Promise<string> {
-  return mkdtemp(join(tmpdir(), 'run-sync-test-'));
-}
-
-async function realRemoveDir(path: string): Promise<void> {
-  await rm(path, { recursive: true, force: true });
-}
 
 interface Harness {
   deps: SyncDeps;
@@ -49,9 +36,9 @@ function makeDeps(overrides: Partial<SyncDeps> = {}): Harness {
   const deps: SyncDeps = {
     now: () => NOW,
     loadSettings: async () => BASE_SETTINGS,
-    resolveIdentity: async () => 'dev@example.invalid',
-    createTarget: () => fakeTarget(async () => {}),
+    resolveIdentity: async () => 'Jane.Doe@x.com',
     buildReport: async () => REPORT,
+    send: async () => {},
     readMarker: async () => null,
     writeMarker: async () => {},
     appendLog: async (line: string): Promise<void> => {
@@ -62,8 +49,6 @@ function makeDeps(overrides: Partial<SyncDeps> = {}): Harness {
     },
     platform: 'linux',
     source: {} as AnalyticsSource,
-    makeTempDir: realMakeTempDir,
-    removeDir: realRemoveDir,
     ...overrides,
   };
 
@@ -71,77 +56,109 @@ function makeDeps(overrides: Partial<SyncDeps> = {}): Harness {
 }
 
 describe('runSync', () => {
-  it('AC2: a daily run reads the marker for the window and stamps it at the run start now only after deliver resolves', async () => {
-    const lastSent = new Date(NOW.getTime() - 10 * DAY_MS);
-    const readMarker = vi.fn(async () => lastSent);
-    const writeMarker = vi.fn(async () => {});
-    const buildReport = vi.fn(async () => REPORT);
-    const deliver = vi.fn(async () => {});
-
-    const { deps } = makeDeps({
-      readMarker,
-      writeMarker,
-      buildReport,
-      createTarget: () => fakeTarget(deliver),
+  it('no installed settings fails setup naming the install command, never sends, and exits 1', async () => {
+    const send = vi.fn(async () => {});
+    const { deps, printed, logged } = makeDeps({
+      loadSettings: async () => null,
+      send,
     });
 
-    const code = await runSync({}, deps);
+    const code = await runSync(deps);
 
-    expect(code).toBe(0);
-    expect(readMarker).toHaveBeenCalledWith(NOW);
-
-    const passedWindow = buildReport.mock.calls[0]?.[0]?.window;
-    expect(passedWindow.to).toEqual(NOW);
-    expect(passedWindow.from).toEqual(new Date(NOW.getTime() - (10 * DAY_MS + HOUR_MS)));
-    expect(passedWindow.backfill).toBe(false);
-
-    expect(deliver).toHaveBeenCalledTimes(1);
-    expect(writeMarker).toHaveBeenCalledWith(NOW);
+    expect(code).toBe(1);
+    expect(send).not.toHaveBeenCalled();
+    expect(printed.some((line) => /fail setup/.test(line) && line.includes('codemie analytics sync install'))).toBe(
+      true
+    );
+    expect(logged.some((line) => /fail setup/.test(line) && line.includes('codemie analytics sync install'))).toBe(
+      true
+    );
   });
 
-  it('AC3: a failing delivery returns 1, leaves the marker unchanged, and still removes the temp dir', async () => {
+  it('a 2xx send writes the marker at now() and logs ok sent <name> <bytes>', async () => {
     const writeMarker = vi.fn(async () => {});
-    const removeDir = vi.fn(realRemoveDir);
-    const deliver = vi.fn(async () => {
-      throw new SyncDeliveryError('Webhook delivery failed with status 500');
+    const send = vi.fn(async () => {});
+
+    const { deps, printed, logged } = makeDeps({ writeMarker, send });
+
+    const code = await runSync(deps);
+
+    expect(code).toBe(0);
+    expect(writeMarker).toHaveBeenCalledWith(NOW);
+
+    const expected = `ok sent ${REPORT.fileName} ${REPORT.bytes.length}`;
+    expect(printed.some((line) => line.includes(expected))).toBe(true);
+    expect(logged.some((line) => line.includes(expected))).toBe(true);
+  });
+
+  it('a null report skips delivery, leaves the marker unchanged, and exits 0', async () => {
+    const writeMarker = vi.fn(async () => {});
+    const send = vi.fn(async () => {});
+    const buildReport = vi.fn(async () => null);
+
+    const { deps, printed, logged } = makeDeps({ buildReport, writeMarker, send });
+
+    const code = await runSync(deps);
+
+    expect(code).toBe(0);
+    expect(send).not.toHaveBeenCalled();
+    expect(writeMarker).not.toHaveBeenCalled();
+    expect(printed.some((line) => /\bskip\b/.test(line))).toBe(true);
+    expect(logged.some((line) => /\bskip\b/.test(line))).toBe(true);
+  });
+
+  it('a send rejection whose cause carries a signed URL fails send without leaking the signature', async () => {
+    const writeMarker = vi.fn(async () => {});
+    const send = vi.fn(async () => {
+      throw new Error('delivery failed', {
+        cause: new Error('network error for https://example.invalid/hook?sig=abc'),
+      });
     });
 
-    const { deps, printed, logged } = makeDeps({
-      writeMarker,
-      removeDir,
-      createTarget: () => fakeTarget(deliver),
-    });
+    const { deps, printed, logged } = makeDeps({ send, writeMarker });
 
-    const code = await runSync({}, deps);
+    const code = await runSync(deps);
 
     expect(code).toBe(1);
     expect(writeMarker).not.toHaveBeenCalled();
-    expect(removeDir).toHaveBeenCalledTimes(1);
-    expect(printed.some((line) => line.startsWith('fail webhook'))).toBe(true);
-    expect(logged.some((line) => line.startsWith('fail webhook'))).toBe(true);
+    expect(printed.some((line) => /fail send/.test(line))).toBe(true);
+    expect(printed.some((line) => line.includes('abc'))).toBe(false);
+    expect(logged.some((line) => line.includes('abc'))).toBe(false);
   });
 
-  it('AC4: no sessions in the window skips delivery, leaves the marker unchanged, and exits 0', async () => {
-    const deliver = vi.fn(async () => {});
+  it('an ExportTooLargeError from send fails export and names the size', async () => {
     const writeMarker = vi.fn(async () => {});
-    const buildReport = vi.fn(async () => null);
-
-    const { deps, printed, logged } = makeDeps({
-      buildReport,
-      writeMarker,
-      createTarget: () => fakeTarget(deliver),
+    const send = vi.fn(async () => {
+      throw new ExportTooLargeError(71_000_000, 70_000_000);
     });
 
-    const code = await runSync({}, deps);
+    const { deps, printed, logged } = makeDeps({ send, writeMarker });
 
-    expect(code).toBe(0);
-    expect(deliver).not.toHaveBeenCalled();
+    const code = await runSync(deps);
+
+    expect(code).toBe(1);
     expect(writeMarker).not.toHaveBeenCalled();
-    expect(printed.some((line) => line.startsWith('skip webhook'))).toBe(true);
-    expect(logged.some((line) => line.startsWith('skip webhook'))).toBe(true);
+    expect(printed.some((line) => /fail export/.test(line) && line.includes('71000000'))).toBe(true);
+    expect(logged.some((line) => /fail export/.test(line) && line.includes('71000000'))).toBe(true);
   });
 
-  it('AC5: no resolvable identity fails without building a report, naming the install command', async () => {
+  it('a report-build error fails export', async () => {
+    const buildReport = vi.fn(async () => {
+      throw new Error('aggregate failed');
+    });
+    const send = vi.fn(async () => {});
+
+    const { deps, printed, logged } = makeDeps({ buildReport, send });
+
+    const code = await runSync(deps);
+
+    expect(code).toBe(1);
+    expect(send).not.toHaveBeenCalled();
+    expect(printed.some((line) => /fail export/.test(line))).toBe(true);
+    expect(logged.some((line) => /fail export/.test(line))).toBe(true);
+  });
+
+  it('no resolvable identity fails setup without building a report', async () => {
     const buildReport = vi.fn(async () => REPORT);
 
     const { deps, printed, logged } = makeDeps({
@@ -151,91 +168,38 @@ describe('runSync', () => {
       buildReport,
     });
 
-    const code = await runSync({}, deps);
+    const code = await runSync(deps);
 
     expect(code).toBe(1);
     expect(buildReport).not.toHaveBeenCalled();
-    expect(printed.some((line) => line.includes('codemie analytics sync install'))).toBe(true);
-    expect(logged.some((line) => line.includes('codemie analytics sync install'))).toBe(true);
+    expect(printed.some((line) => /fail setup/.test(line))).toBe(true);
+    expect(logged.some((line) => /fail setup/.test(line))).toBe(true);
   });
 
-  it('AC6: a backfill (--last) never reads or writes any marker', async () => {
-    const readMarker = vi.fn(async () => null);
-    const writeMarker = vi.fn(async () => {});
-    const deliver = vi.fn(async () => {});
+  it('builds the daily window from the marker, starting at least 10 days back for a 10-day-old marker with a 7 day lookback', async () => {
+    const lastSent = new Date(NOW.getTime() - 10 * DAY_MS);
+    const readMarker = vi.fn(async () => lastSent);
+    const buildReport = vi.fn(async () => REPORT);
 
-    const { deps } = makeDeps({
-      readMarker,
-      writeMarker,
-      createTarget: () => fakeTarget(deliver),
-    });
+    const { deps } = makeDeps({ readMarker, buildReport });
 
-    const code = await runSync({ last: '30d' }, deps);
+    const code = await runSync(deps);
 
     expect(code).toBe(0);
-    expect(readMarker).not.toHaveBeenCalled();
-    expect(writeMarker).not.toHaveBeenCalled();
-    expect(deliver).toHaveBeenCalledTimes(1);
+    expect(readMarker).toHaveBeenCalledWith(NOW);
+
+    const passedWindow = buildReport.mock.calls[0]?.[0]?.window;
+    expect(passedWindow.to).toEqual(NOW);
+    expect(NOW.getTime() - passedWindow.from.getTime()).toBeGreaterThanOrEqual(10 * DAY_MS);
   });
 
-  it('AC7: no installed settings fails and names --webhook', async () => {
-    const { deps, printed, logged } = makeDeps({
-      loadSettings: async () => null,
-    });
-
-    const code = await runSync({}, deps);
-
-    expect(code).toBe(1);
-    expect(printed.some((line) => line.includes('--webhook'))).toBe(true);
-    expect(logged.some((line) => line.includes('--webhook'))).toBe(true);
-  });
-
-  it('AC8: a delivery error carrying a signed URL never leaks sig into printed or logged lines', async () => {
-    const deliver = vi.fn(async () => {
-      throw new SyncDeliveryError('Webhook delivery failed for https://example.invalid/hook?sig=FAKESIG');
-    });
-
-    const { deps, printed, logged } = makeDeps({
-      createTarget: () => fakeTarget(deliver),
-    });
-
-    const code = await runSync({}, deps);
-
-    expect(code).toBe(1);
-    expect(printed.some((line) => line.includes('FAKESIG'))).toBe(false);
-    expect(logged.some((line) => line.includes('FAKESIG'))).toBe(false);
-  });
-
-  it('removes the temp dir in a finally even when delivery throws', async () => {
-    const removeDir = vi.fn(realRemoveDir);
-    const deliver = vi.fn(async () => {
-      throw new Error('boom');
-    });
-
+  it('never throws, even when an unexpected error occurs reading settings', async () => {
     const { deps } = makeDeps({
-      removeDir,
-      createTarget: () => fakeTarget(deliver),
+      loadSettings: async () => {
+        throw new Error('disk on fire');
+      },
     });
 
-    await runSync({}, deps);
-
-    expect(removeDir).toHaveBeenCalledTimes(1);
-  });
-
-  it('no installed settings returns 1 without creating or removing a temp dir', async () => {
-    const makeTempDir = vi.fn(realMakeTempDir);
-    const removeDir = vi.fn(realRemoveDir);
-
-    const { deps } = makeDeps({
-      loadSettings: async () => null,
-      makeTempDir,
-      removeDir,
-    });
-
-    const code = await runSync({}, deps);
-
-    expect(code).toBe(1);
-    expect(makeTempDir).not.toHaveBeenCalled();
-    expect(removeDir).not.toHaveBeenCalled();
+    await expect(runSync(deps)).resolves.toBe(1);
   });
 });

@@ -5,7 +5,7 @@ import type { RawSessionData } from '../../data-loader.js';
 import type { AnalyticsSource, SourceLoadOptions, SourceResult } from '../../sources/types.js';
 import type { CostSummary, SessionCost, SessionCostIndex } from '../../cost/types.js';
 import { buildSyncReport } from '../report-builder.js';
-import { dailyWindow, backfillWindow } from '../window.js';
+import { dailyWindow } from '../window.js';
 
 const EMAIL = 'Dev.User+tag@example.com';
 
@@ -91,7 +91,7 @@ describe('buildSyncReport', () => {
     expect(report).toBeNull();
   });
 
-  it('builds a daily report with the slugged filename and matching meta fields', async () => {
+  it('builds a daily report with the lowercased, slugged filename and matching meta fields', async () => {
     const now = new Date('2026-10-29T12:34:56.000Z');
     const window = dailyWindow(now, null, 7);
     const source = new StubSource({ rawSessions: [session('s1')], cost: cost('s1') });
@@ -99,7 +99,9 @@ describe('buildSyncReport', () => {
     const report = await buildSyncReport({ source, window, email: EMAIL, includeExternal: false, now });
 
     expect(report).not.toBeNull();
-    expect(report!.fileName).toBe('codemie-analytics-Dev-User-tag-example-com-2026-10-29.report.json');
+    // emailSlug is applied to the lowercased email, so sync filenames never carry mixed case
+    // even though the shared `emailSlug` helper itself is unchanged.
+    expect(report!.fileName).toBe('codemie-analytics-dev-user-tag-example-com-2026-10-29.report.json');
 
     const payload = JSON.parse(report!.bytes.toString('utf-8'));
     expect(payload.meta.userEmail).toBe(EMAIL);
@@ -109,20 +111,5 @@ describe('buildSyncReport', () => {
 
     // Bytes match the exact `generateReportJson` shape: JSON.stringify(payload, null, 2).
     expect(report!.bytes.toString('utf-8')).toBe(JSON.stringify(payload, null, 2));
-  });
-
-  it('builds a backfill report named after the window label', async () => {
-    const now = new Date('2026-10-29T00:00:00.000Z');
-    const window = backfillWindow({ from: '2026-10-01', to: '2026-10-05' }, now)!;
-    const source = new StubSource({ rawSessions: [session('s1')], cost: cost('s1') });
-
-    const report = await buildSyncReport({ source, window, email: EMAIL, includeExternal: false, now });
-
-    expect(report).not.toBeNull();
-    expect(report!.fileName).toBe(`codemie-analytics-Dev-User-tag-example-com-${window.label}.report.json`);
-
-    const payload = JSON.parse(report!.bytes.toString('utf-8'));
-    expect(payload.meta.periodStart).toBe(window.from.toISOString());
-    expect(payload.meta.periodEnd).toBe(window.to.toISOString());
   });
 });

@@ -1,30 +1,27 @@
 /**
- * Sync runner for `codemie analytics sync`.
+ * Sync runner for `codemie analytics sync run` — single-webhook, unattended.
  *
- * Ties together settings, identity, the daily/backfill window, the in-process report
- * builder and webhook delivery into one unattended run. Every side effect (clock,
- * settings, identity, fs, delivery) is injected via {@link SyncDeps} so tests run without
- * network or real files.
+ * Ties together settings, identity, the daily window, the in-process report builder and
+ * webhook delivery into one run. Every side effect (clock, settings, identity, marker, fs,
+ * delivery, output) is injected via {@link SyncDeps} so tests run without network or real
+ * files.
  *
- * Preconditions (invalid backfill flags, a settings error, no installed settings, no
- * resolvable identity) short-circuit the run: one `fail <category> — <detail>` line is
- * printed and logged, and `runSync` returns 1. It never throws and never calls
- * `process.exit`.
- *
- * NOTE: this is a transitional, compile-keeping adaptation onto the collector-compatible
- * settings/marker store (Task 1 of the EPMCDME-16488 plan). A later task in the same plan
- * rewrites this module fully onto the `install`/`status`/`run`/`uninstall` surface (hidden
- * `--scheduled`, the `setup`/`export`/`send` failure categories, and the exact log line
- * format the spec defines) — the multi-target grouping this file inherited from the
- * branch's `sync`/`sync config` surface is intentionally left as-is, collapsed to the one
- * webhook target `SyncSettings` now describes.
+ * `runSync` never throws and never calls `process.exit`. Every outcome — success, a skipped
+ * empty window, or any failure — prints and appends exactly one line via {@link formatLogLine}:
+ *   `<ISO> ok sent <name> <bytes>`
+ *   `<ISO> skip <reason>`
+ *   `<ISO> fail <setup|export|send> <redacted detail>`
+ * and returns 0 for `ok`/`skip`, 1 for `fail`. Category mapping: missing/invalid settings, no
+ * resolvable identity, and any other precondition error -> `setup`; a report-build failure or
+ * an `ExportTooLargeError` (its message carries the byte count) -> `export`; any other webhook
+ * delivery failure -> `send`. The marker only moves (to the run's `now()`) after delivery
+ * resolves — never on `skip` or `fail`.
  */
-import { appendFile, mkdir, mkdtemp, rm, writeFile } from 'fs/promises';
-import { tmpdir } from 'os';
-import { dirname, join } from 'path';
+import { appendFile, chmod, mkdir } from 'fs/promises';
+import { dirname } from 'path';
 
 import { getCodemiePath } from '@/utils/paths.js';
-import { SyncTargetMissingError } from '@/utils/errors.js';
+import { ExportTooLargeError, SyncTargetMissingError } from '@/utils/errors.js';
 
 import { DEFAULT_LOOKBACK_DAYS, loadSyncSettings } from './config-store.js';
 import { realIdentityDeps, resolveSyncIdentity } from './identity.js';
@@ -32,32 +29,19 @@ import { readMarker, writeMarker } from './marker.js';
 import { includeExternalFor } from './policy.js';
 import { errorMessage, redactSecrets } from './redact.js';
 import { buildSyncReport } from './report-builder.js';
-import { WebhookTarget } from './targets/webhook-target.js';
-import type { SyncReport, SyncResult, SyncStatus, SyncSettings } from './types.js';
-import { backfillWindow, dailyWindow } from './window.js';
-import type { SyncWindow } from './window.js';
+import { sendWebhook } from './targets/webhook-target.js';
+import type { SyncReport, SyncSettings } from './types.js';
+import { dailyWindow } from './window.js';
 import { SessionsSource } from '../sources/sessions-source.js';
 import type { AnalyticsSource } from '../sources/types.js';
-
-/** Raw `--from`/`--to`/`--last` flags as given on the CLI. */
-export interface RunSyncOptions {
-  from?: string;
-  to?: string;
-  last?: string;
-}
-
-/** The one delivery target `runSync` ships to — a thin seam over `WebhookTarget`. */
-export interface SyncDeliveryTarget {
-  deliver(report: SyncReport): Promise<void>;
-}
 
 /** Every side effect `runSync` needs, injected so tests run without network or real files. */
 export interface SyncDeps {
   now(): Date;
   loadSettings(): Promise<SyncSettings | null>;
   resolveIdentity(): Promise<string>;
-  createTarget(settings: SyncSettings): SyncDeliveryTarget;
   buildReport: typeof buildSyncReport;
+  send(url: string, report: SyncReport): Promise<void>;
   readMarker(now: Date): Promise<Date | null>;
   writeMarker(at: Date): Promise<void>;
   appendLog(line: string): Promise<void>;
@@ -65,138 +49,103 @@ export interface SyncDeps {
   platform: NodeJS.Platform;
   /** The analytics data source `buildReport` loads sessions from. */
   source: AnalyticsSource;
-  makeTempDir(): Promise<string>;
-  removeDir(path: string): Promise<void>;
 }
 
-/** Category for every webhook-related print/log line. There is only one target. */
-const WEBHOOK_CATEGORY = 'webhook';
+type Outcome = 'ok' | 'skip' | 'fail';
 
-async function emit(deps: SyncDeps, status: SyncStatus, category: string, detail: string): Promise<SyncResult> {
-  const line = redactSecrets(`${status} ${category} — ${detail}`);
+/** Format one log/print line: `<ISO> <outcome> <rest>`, with any webhook signature redacted. */
+export function formatLogLine(at: Date, outcome: Outcome, rest: string): string {
+  return redactSecrets(`${at.toISOString()} ${outcome} ${rest}`);
+}
+
+async function emit(deps: SyncDeps, now: Date, outcome: Outcome, rest: string): Promise<void> {
+  const line = formatLogLine(now, outcome, rest);
   deps.print(line);
   await deps.appendLog(line);
-  return { status, category, detail };
 }
 
-async function failPrecondition(deps: SyncDeps, category: string, err: unknown): Promise<number> {
-  await emit(deps, 'fail', category, errorMessage(err));
-  return 1;
-}
-
-export async function runSync(opts: RunSyncOptions, deps: SyncDeps): Promise<number> {
-  const now = deps.now();
-
-  let backfill: SyncWindow | null;
-  try {
-    backfill = backfillWindow(opts, now);
-  } catch (err) {
-    return failPrecondition(deps, 'config', err);
-  }
-
-  let settings: SyncSettings | null;
-  try {
-    settings = await deps.loadSettings();
-  } catch (err) {
-    return failPrecondition(deps, 'config', err);
-  }
+async function run(deps: SyncDeps, now: Date): Promise<number> {
+  const settings = await deps.loadSettings();
 
   if (settings === null) {
-    return failPrecondition(deps, 'target', new SyncTargetMissingError());
+    await emit(deps, now, 'fail', `setup ${errorMessage(new SyncTargetMissingError())}`);
+    return 1;
   }
 
-  const target = deps.createTarget(settings);
-
-  let email: string;
-  try {
-    email = await deps.resolveIdentity();
-  } catch (err) {
-    return failPrecondition(deps, 'identity', err);
-  }
-
-  const includeExternal = includeExternalFor(settings.includeExternal, deps.platform);
+  // Identity, the window and the include-external policy are all preconditions resolved
+  // before the report is built; any failure here (including an unexpected throw) is a `setup`
+  // failure, caught by `runSync`'s outer handler below.
+  const email = await deps.resolveIdentity();
+  const lastSent = await deps.readMarker(now);
   const lookbackDays = settings.lookbackDays ?? DEFAULT_LOOKBACK_DAYS;
+  const window = dailyWindow(now, lastSent, lookbackDays);
+  const includeExternal = includeExternalFor(settings.includeExternal, deps.platform);
 
-  let tempDir: string | undefined;
+  let report: SyncReport | null;
+  try {
+    report = await deps.buildReport({ source: deps.source, window, email, includeExternal, now });
+  } catch (err) {
+    await emit(deps, now, 'fail', `export ${errorMessage(err)}`);
+    return 1;
+  }
+
+  if (report === null) {
+    await emit(deps, now, 'skip', `no sessions in window ${window.label}`);
+    return 0;
+  }
 
   try {
-    // A backfill window is explicit and never reads the marker; the recurring daily window
-    // does.
-    const window = backfill ?? dailyWindow(now, await deps.readMarker(now), lookbackDays);
-
-    tempDir = await deps.makeTempDir();
-
-    let report: SyncReport | null;
-    try {
-      report = await deps.buildReport({
-        source: deps.source,
-        window,
-        email,
-        includeExternal,
-        now,
-      });
-    } catch (err) {
-      await emit(deps, 'fail', 'report', `${WEBHOOK_CATEGORY} window ${window.label}: ${errorMessage(err)}`);
-      return 1;
-    }
-
-    if (report === null) {
-      await emit(deps, 'skip', WEBHOOK_CATEGORY, `no sessions in window ${window.label}`);
-      return 0;
-    }
-
-    await writeFile(join(tempDir, report.fileName), report.bytes);
-
-    try {
-      await target.deliver(report);
-      if (!window.backfill) {
-        await deps.writeMarker(now);
-      }
-      await emit(deps, 'ok', WEBHOOK_CATEGORY, `delivered for window ${window.label}`);
-      return 0;
-    } catch (err) {
-      await emit(
-        deps,
-        'fail',
-        WEBHOOK_CATEGORY,
-        `${WEBHOOK_CATEGORY} window ${window.label}: ${errorMessage(err)}`
-      );
-      return 1;
-    }
+    await deps.send(settings.webhookUrl, report);
   } catch (err) {
-    return failPrecondition(deps, 'sync', err);
-  } finally {
-    if (tempDir !== undefined) {
-      await deps.removeDir(tempDir);
-    }
+    const category = err instanceof ExportTooLargeError ? 'export' : 'send';
+    await emit(deps, now, 'fail', `${category} ${errorMessage(err)}`);
+    return 1;
+  }
+
+  await deps.writeMarker(now);
+  await emit(deps, now, 'ok', `sent ${report.fileName} ${report.bytes.length}`);
+  return 0;
+}
+
+export async function runSync(deps: SyncDeps): Promise<number> {
+  const now = deps.now();
+
+  try {
+    return await run(deps, now);
+  } catch (err) {
+    await emit(deps, now, 'fail', `setup ${errorMessage(err)}`);
+    return 1;
   }
 }
 
-function createRealTarget(settings: SyncSettings): SyncDeliveryTarget {
-  return new WebhookTarget(settings.webhookUrl);
+const LOG_DIR_MODE = 0o700;
+const LOG_FILE_MODE = 0o600;
+
+/** Append `line` to `~/.codemie/logs/analytics-sync.log` (dir 0700, file 0600). */
+async function appendSyncLog(line: string): Promise<void> {
+  const logPath = getCodemiePath('logs', 'analytics-sync.log');
+  const logDir = dirname(logPath);
+  await mkdir(logDir, { recursive: true, mode: LOG_DIR_MODE });
+  await chmod(logDir, LOG_DIR_MODE);
+  await appendFile(logPath, `${line}\n`, { mode: LOG_FILE_MODE });
+  await chmod(logPath, LOG_FILE_MODE);
 }
 
-/** Real dependencies for `runSync`: real clock, settings, identity, fs and network. */
+/** Real dependencies for `runSync`: real clock, settings, identity, marker, fs and network. */
 export function realSyncDeps(): SyncDeps {
   return {
     now: () => new Date(),
     loadSettings: () => loadSyncSettings(),
     resolveIdentity: () => resolveSyncIdentity(realIdentityDeps),
-    createTarget: createRealTarget,
     buildReport: buildSyncReport,
+    send: (url: string, report: SyncReport) => sendWebhook(url, report),
     readMarker: (now: Date) => readMarker(now),
     writeMarker: (at: Date) => writeMarker(at),
-    appendLog: async (line: string): Promise<void> => {
-      const logPath = getCodemiePath('logs', 'analytics-sync.log');
-      await mkdir(dirname(logPath), { recursive: true });
-      await appendFile(logPath, `${new Date().toISOString()} ${line}\n`);
-    },
+    appendLog: appendSyncLog,
     print: (line: string): void => {
       console.log(line);
     },
     platform: process.platform,
     source: new SessionsSource(),
-    makeTempDir: () => mkdtemp(join(tmpdir(), 'codemie-analytics-sync-')),
-    removeDir: (path: string) => rm(path, { recursive: true, force: true }),
   };
 }

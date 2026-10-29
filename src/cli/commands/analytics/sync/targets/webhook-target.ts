@@ -1,10 +1,16 @@
 /**
  * Webhook delivery target for `codemie analytics sync`.
  *
- * POSTs the analytics export as a single JSON attachment to a configured
- * HTTPS webhook URL. Any 2xx response resolves; a non-2xx response or a
- * `fetchImpl` rejection becomes a `SyncDeliveryError` with a redacted
- * message (the signed URL query parameter must never leak into it).
+ * POSTs the analytics export as a single JSON attachment to a configured HTTPS webhook URL —
+ * the one target `codemie analytics sync` ships to (no per-target grouping, no retry). Any 2xx
+ * response resolves; a response above {@link MAX_EXPORT_BYTES} throws `ExportTooLargeError`
+ * before any network call; a redirect response or a non-2xx response or a `fetchImpl`
+ * rejection becomes a `SyncDeliveryError` with a redacted message (the signed URL query
+ * parameter must never leak into it).
+ *
+ * `sendWebhook` is the free-function seam `run-sync.ts`'s `SyncDeps.send(url, report)` wires to;
+ * `WebhookTarget` is its implementation, constructed fresh per call since the URL can change
+ * between settings reads.
  */
 
 import { ExportTooLargeError, SyncDeliveryError } from '../../../../../utils/errors.js';
@@ -15,7 +21,7 @@ export const MAX_EXPORT_BYTES = 70_000_000;
 
 const defaultFetch: typeof fetch = (...args: Parameters<typeof fetch>) => fetch(...args);
 
-/** POSTs the analytics export to one webhook URL. Implements `SyncDeliveryTarget` from `run-sync.ts`. */
+/** POSTs one analytics export to one webhook URL. */
 export class WebhookTarget {
   readonly id = 'webhook';
 
@@ -46,6 +52,7 @@ export class WebhookTarget {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body,
+        redirect: 'error',
       });
     } catch (err) {
       throw new SyncDeliveryError(errorMessage(err));
@@ -55,4 +62,9 @@ export class WebhookTarget {
       throw new SyncDeliveryError(`Webhook delivery failed with status ${response.status}`, response.status);
     }
   }
+}
+
+/** Convenience wrapper matching `SyncDeps.send` in `run-sync.ts`: POST `report` to `url`. */
+export async function sendWebhook(url: string, report: SyncReport, fetchImpl?: typeof fetch): Promise<void> {
+  return new WebhookTarget(url, fetchImpl).deliver(report);
 }

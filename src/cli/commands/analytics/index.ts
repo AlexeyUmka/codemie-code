@@ -17,7 +17,6 @@ import { OtelSource } from './sources/otel-source.js';
 import type { AnalyticsSource } from './sources/types.js';
 import { ConfigLoader } from '../../../utils/config.js';
 import { parseDate, parseDuration } from './date-args.js';
-import type { RunSyncOptions } from './sync/run-sync.js';
 
 /**
  * Date on which the deprecated analytics report flags (`--report`, `--report-format`,
@@ -59,29 +58,25 @@ export function createAnalyticsCommand(): Command {
     });
   command.addCommand(otel);
 
-  // `codemie analytics sync` — unattended report upload. Rebuilt onto `install`/`status`/
-  // `run`/`uninstall` by a later task in this plan (EPMCDME-16488); for now this keeps the
-  // branch's backfill-capable `sync` action compiling against the collector-compatible
-  // state store (`sync/config-store.ts`, `sync/marker.ts`).
+  // `codemie analytics sync` — unattended report upload to the configured webhook. Rebuilt
+  // onto `install`/`status`/`run`/`uninstall` by a later task in this plan (EPMCDME-16488);
+  // for now this keeps a bare `sync` action compiling against the single-webhook runner
+  // (`sync/run-sync.ts`). No backfill flags: `run` always syncs the daily marker window.
   command.addCommand(createSyncCommand());
 
   return command;
 }
 
 /**
- * `codemie analytics sync` — unattended upload of the analytics JSON report to every
- * configured target. Backfill flags use the same names/formats as the base command.
- * Never prompts; `runSync` itself never throws and never calls `process.exit`.
+ * `codemie analytics sync` — unattended upload of the analytics JSON report to the configured
+ * webhook. Never prompts; `runSync` itself never throws and never calls `process.exit`.
  */
 function createSyncCommand(): Command {
   return new Command('sync')
-    .description('Unattended upload of the analytics report to every configured target')
-    .option('--from <date>', 'Backfill: sync sessions from date (YYYY-MM-DD)')
-    .option('--to <date>', 'Backfill: sync sessions to date (YYYY-MM-DD)')
-    .option('--last <duration>', 'Backfill: sync sessions from last duration (e.g., 7d, 24h)')
-    .action(async (opts: RunSyncOptions) => {
+    .description('Unattended upload of the analytics report to the configured webhook')
+    .action(async () => {
       const { runSync, realSyncDeps } = await import('./sync/run-sync.js');
-      process.exitCode = await runSync(opts, realSyncDeps());
+      process.exitCode = await runSync(realSyncDeps());
     });
 }
 

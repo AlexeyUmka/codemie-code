@@ -1,16 +1,17 @@
 /**
  * CLI wiring tests for `codemie analytics sync` (EPMCDME-16554, Task 8; adapted for
- * EPMCDME-16488 Task 1).
+ * EPMCDME-16488 Tasks 1-2).
  *
  * `sync config` (and the `applySyncUpdate`/`loadSyncConfig` config-store API it used) was
  * removed as part of moving sync state onto the collector-compatible store
- * (`sync/config-store.ts`, `sync/marker.ts`). A later task in the EPMCDME-16488 plan
- * rebuilds `sync` onto `install`/`status`/`run`/`uninstall`; for now this file only covers
- * what still exists: `sync` forwarding its backfill flags to `runSync`/`realSyncDeps`.
+ * (`sync/config-store.ts`, `sync/marker.ts`). Backfill (`--from`/`--to`/`--last`) was removed
+ * from `runSync` in Task 2 — single-webhook runs only read the daily marker window — so `sync`
+ * no longer accepts or forwards those flags. A later task in the EPMCDME-16488 plan rebuilds
+ * `sync` onto `install`/`status`/`run`/`uninstall`; for now this file only covers what still
+ * exists: `sync` calling `runSync(realSyncDeps())` with no arguments.
  *
  * Covers:
- *  - `sync` forwards --from/--to/--last to `runSync`/`realSyncDeps`, exit code is runSync's
- *    return value.
+ *  - `sync` calls `runSync(realSyncDeps())`, exit code is runSync's return value.
  *  - the parent's boolean `--include-external` and `analytics otel --file f --from <date>`
  *    still work (regression for `.enablePositionalOptions()`).
  */
@@ -49,22 +50,19 @@ describe('analytics sync CLI wiring', () => {
     process.exitCode = undefined;
   });
 
-  it('forwards --from/--to/--last to runSync with realSyncDeps(), and sets exitCode from its result', async () => {
+  it('calls runSync with realSyncDeps(), and sets exitCode from its result', async () => {
     runSyncMock.mockResolvedValue(0);
-    await parse(['sync', '--from', '2026-10-01', '--to', '2026-10-15']);
+    await parse(['sync']);
 
-    expect(runSyncMock).toHaveBeenCalledWith(
-      expect.objectContaining({ from: '2026-10-01', to: '2026-10-15' }),
-      { fake: 'deps' }
-    );
+    expect(runSyncMock).toHaveBeenCalledWith({ fake: 'deps' });
     expect(process.exitCode).toBe(0);
   });
 
-  it('forwards --last to runSync', async () => {
+  it('sets a non-zero exitCode when runSync fails', async () => {
     runSyncMock.mockResolvedValue(1);
-    await parse(['sync', '--last', '3d']);
+    await parse(['sync']);
 
-    expect(runSyncMock).toHaveBeenCalledWith(expect.objectContaining({ last: '3d' }), { fake: 'deps' });
+    expect(runSyncMock).toHaveBeenCalledWith({ fake: 'deps' });
     expect(process.exitCode).toBe(1);
   });
 });

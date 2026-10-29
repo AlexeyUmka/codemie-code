@@ -1,15 +1,10 @@
 /**
  * Date windows for `codemie analytics sync`.
  *
- * `dailyWindow` builds the recurring day-to-day sync window from the last-sent marker.
- * `backfillWindow` mirrors how the interactive `analytics` command turns `--from`/`--to`/
- * `--last` into a date range (see `parseFilterOptions` in `../index.ts`), except that an
- * invalid value throws `SyncConfigError` instead of being silently ignored.
+ * `dailyWindow` builds the recurring day-to-day sync window from the last-sent marker. There
+ * is no backfill window any more (EPMCDME-16488 dropped `--from`/`--to`/`--last`): `run`
+ * always syncs the daily window computed here.
  */
-
-import { SyncConfigError } from '@/utils/errors.js';
-
-import { parseDate, parseDuration } from '../date-args.js';
 
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
@@ -17,7 +12,6 @@ const DAY_MS = 24 * HOUR_MS;
 export interface SyncWindow {
   from: Date;
   to: Date;
-  backfill: boolean;
   label: string;
 }
 
@@ -49,71 +43,6 @@ export function dailyWindow(now: Date, lastSent: Date | null, lookbackDays: numb
   return {
     from,
     to,
-    backfill: false,
-    label: dailyLabel(from, to)
-  };
-}
-
-/** Raw `--from`/`--to`/`--last` flags as given on the CLI. */
-export interface BackfillWindowOptions {
-  from?: string;
-  to?: string;
-  last?: string;
-}
-
-/**
- * Build a one-off backfill window from `--from`/`--to`/`--last`.
- *
- * Returns `null` when none of the three flags is given. Throws `SyncConfigError` on any
- * invalid value (unlike the interactive command, which ignores invalid filters). When only
- * `--from` is given, `to` defaults to `now`. `--last` takes precedence over `--from`/`--to`,
- * same as the interactive command's filter building.
- */
-export function backfillWindow(opts: BackfillWindowOptions, now: Date): SyncWindow | null {
-  if (opts.from === undefined && opts.to === undefined && opts.last === undefined) {
-    return null;
-  }
-
-  let from: Date | undefined;
-  let to: Date | undefined;
-
-  if (opts.from !== undefined) {
-    const parsed = parseDate(opts.from);
-    if (!parsed) {
-      throw new SyncConfigError(`Invalid --from date "${opts.from}". Expected YYYY-MM-DD.`);
-    }
-    from = parsed;
-  }
-
-  if (opts.to !== undefined) {
-    const parsed = parseDate(opts.to);
-    if (!parsed) {
-      throw new SyncConfigError(`Invalid --to date "${opts.to}". Expected YYYY-MM-DD.`);
-    }
-    to = parsed;
-  }
-
-  if (opts.last !== undefined) {
-    const duration = parseDuration(opts.last);
-    if (duration === null) {
-      throw new SyncConfigError(`Invalid --last duration "${opts.last}". Expected e.g. "7d" or "24h".`);
-    }
-    from = new Date(now.getTime() - duration);
-    to = now;
-  }
-
-  if (to === undefined) {
-    to = now;
-  }
-
-  if (from === undefined) {
-    throw new SyncConfigError('Backfill requires --from or --last.');
-  }
-
-  return {
-    from,
-    to,
-    backfill: true,
     label: dailyLabel(from, to)
   };
 }

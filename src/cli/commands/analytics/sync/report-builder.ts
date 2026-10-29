@@ -1,5 +1,5 @@
 /**
- * Builds the JSON report `codemie analytics sync` uploads to each configured target.
+ * Builds the JSON report `codemie analytics sync` uploads to the configured webhook target.
  *
  * Reuses the same in-process pipeline the interactive `codemie analytics` command uses
  * (`loadAnalytics`) and the same payload shape (`buildPayload`), so the bytes produced here are
@@ -59,10 +59,11 @@ export async function buildSyncReport(opts: BuildSyncReportOptions): Promise<Syn
     periodEnd: window.to.toISOString(),
   });
 
-  const slug = emailSlug(email);
-  const fileName = window.backfill
-    ? `codemie-analytics-${slug}-${window.label}.report.json`
-    : `codemie-analytics-${slug}-${formatUtcDate(now)}.report.json`;
+  // Lowercase is applied here only (sync's attachment name), never in the shared `emailSlug`
+  // helper or the interactive export path, so two differently-cased emails for the same
+  // developer always produce the same daily attachment name.
+  const slug = emailSlug(email.toLowerCase());
+  const fileName = `codemie-analytics-${slug}-${formatUtcDate(now)}.report.json`;
 
   return {
     fileName,
