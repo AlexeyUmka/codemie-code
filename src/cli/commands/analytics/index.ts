@@ -17,17 +17,13 @@ import { OtelSource } from './sources/otel-source.js';
 import type { AnalyticsSource } from './sources/types.js';
 import { ConfigLoader } from '../../../utils/config.js';
 import { parseDate, parseDuration } from './date-args.js';
+import { EMAIL_REGEX } from './sync/identity.js';
 
 /**
  * Date on which the deprecated analytics report flags (`--report`, `--report-format`,
  * `--report-output`) will be removed.
  */
 const LEGACY_FLAGS_REMOVAL_DATE = 'November 1, 2026';
-
-/**
- * Same pattern used by the interactive email prompt below.
- */
-const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 export function createAnalyticsCommand(): Command {
   const command = new Command('analytics')

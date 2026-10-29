@@ -10,6 +10,13 @@
 
 import { SyncIdentityMissingError } from '@/utils/errors.js';
 
+/**
+ * Email shape accepted by the `install` command's interactive prompt. Moved here (from
+ * `cli/commands/analytics/index.ts`) so the install runner can validate the prompted value
+ * without importing the CLI command module.
+ */
+export const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
 export interface SyncIdentityDeps {
   loadUserEmail(): Promise<string | undefined>;
   gitEmail(): Promise<string | undefined>;

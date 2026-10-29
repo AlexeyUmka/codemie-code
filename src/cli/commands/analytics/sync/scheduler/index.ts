@@ -10,7 +10,8 @@
  */
 
 import { join } from 'path';
-import { tmpdir } from 'os';
+import { homedir as osHomedir, tmpdir, userInfo } from 'os';
+import { mkdir, rm, writeFile } from 'fs/promises';
 
 import { exec as realExec } from '@/utils/exec.js';
 import { SyncSchedulerUnsupportedError } from '@/utils/errors.js';
@@ -259,4 +260,22 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
   }
 
   return { preflight, register, unregister, query };
+}
+
+/**
+ * Real {@link SchedulerDeps} wired to the actual process/OS — `process.platform`, the real
+ * `exec`, `os.homedir()`, a `process.getuid` fallback (absent on Windows, hence `?? 0` — the
+ * value is unused there since only the darwin branch reads `uid()`), `os.userInfo().username`
+ * and `fs/promises`. Used by `install`/`status`/`uninstall`'s real-deps factories; tests
+ * inject their own fakes instead.
+ */
+export function createRealSchedulerDeps(): SchedulerDeps {
+  return {
+    platform: process.platform,
+    exec: realExec,
+    homedir: () => osHomedir(),
+    uid: () => process.getuid?.() ?? 0,
+    username: () => userInfo().username,
+    fs: { mkdir, writeFile, rm }
+  };
 }
