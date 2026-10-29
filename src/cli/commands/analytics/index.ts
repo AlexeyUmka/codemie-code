@@ -2,7 +2,7 @@
  * Analytics command - display aggregated metrics from sessions
  */
 
-import { Command } from 'commander';
+import { Command, Option } from 'commander';
 import chalk from 'chalk';
 import inquirer from 'inquirer';
 import { mkdirSync } from 'node:fs';
@@ -10,6 +10,7 @@ import { dirname } from 'node:path';
 import { AnalyticsFormatter } from './formatter.js';
 import { loadAnalytics } from './analytics-core.js';
 import type { AnalyticsOptions, AnalyticsFilter, OtelCommandOptions } from './types.js';
+import type { InstallOptions } from './sync/types.js';
 import type { ExportFormat } from './report/output-target.js';
 import { logger } from '../../../utils/logger.js';
 import { SessionsSource } from './sources/sessions-source.js';
@@ -54,25 +55,82 @@ export function createAnalyticsCommand(): Command {
     });
   command.addCommand(otel);
 
-  // `codemie analytics sync` — unattended report upload to the configured webhook. Rebuilt
-  // onto `install`/`status`/`run`/`uninstall` by a later task in this plan (EPMCDME-16488);
-  // for now this keeps a bare `sync` action compiling against the single-webhook runner
-  // (`sync/run-sync.ts`). No backfill flags: `run` always syncs the daily marker window.
+  // `codemie analytics sync` — a daily per-user OS job that sends this machine's analytics
+  // reports one way to the team's webhook. A pure group (no action of its own, no
+  // `--from/--to/--last`): everything lives in its four subcommands below.
   command.addCommand(createSyncCommand());
 
   return command;
 }
 
 /**
- * `codemie analytics sync` — unattended upload of the analytics JSON report to the configured
- * webhook. Never prompts; `runSync` itself never throws and never calls `process.exit`.
+ * `codemie analytics sync` — the group description names the one-way delivery; each
+ * subcommand's own description says who runs it and what it changes (story AC, "Command
+ * surface"). `.enablePositionalOptions()` mirrors the parent command so a subcommand's own
+ * option (e.g. `install --include-external`) is never swallowed by an identically-named
+ * option on `analytics` or on `sync` itself (D14).
  */
 function createSyncCommand(): Command {
-  return new Command('sync')
-    .description('Unattended upload of the analytics report to the configured webhook')
+  const sync = new Command('sync')
+    .description("Send this machine's analytics reports one way to the team's webhook on a daily schedule")
+    .enablePositionalOptions();
+
+  sync.addCommand(createSyncInstallCommand());
+  sync.addCommand(createSyncStatusCommand());
+  sync.addCommand(createSyncRunCommand());
+  sync.addCommand(createSyncUninstallCommand());
+
+  return sync;
+}
+
+/** `codemie analytics sync install` — registers the daily OS job. Dynamic-imports the
+ * install runner so loading `codemie analytics` never pulls in the scheduler module. */
+function createSyncInstallCommand(): Command {
+  return new Command('install')
+    .description('Developer: register the daily delivery job on this machine')
+    .option('--webhook <url>', "The team's https webhook URL that receives the daily report")
+    .option('--at <HH:MM>', 'Daily run time, 24-hour local time (default: 03:00)')
+    .option('--lookback-days <n>', 'Session window looked back on each run, 1-30 (default: 7)')
+    .option('--include-external <policy>', 'Native agent sessions CodeMie did not launch: windows, always, or never (default: windows)')
+    .action(async (options: InstallOptions) => {
+      const { runInstall, createRealInstallDeps } = await import('./sync/install.js');
+      process.exitCode = await runInstall(options, createRealInstallDeps());
+    });
+}
+
+/** `codemie analytics sync status` — reports whether the job is installed and enabled, the
+ * current settings, and the outcome of the last run. */
+function createSyncStatusCommand(): Command {
+  return new Command('status')
+    .description('Developer: show whether the delivery job is installed and its last outcome')
+    .action(async () => {
+      const { runStatus, createRealStatusDeps } = await import('./sync/status.js');
+      process.exitCode = await runStatus(createRealStatusDeps());
+    });
+}
+
+/** `codemie analytics sync run` — sends the pending analytics window to the webhook now.
+ * `--scheduled` is passed by the OS job itself (see `bin/codemie.js`/`scheduled-run.ts`) to
+ * skip the interactive startup checks; it is hidden from `--help` since developers invoke
+ * `run` without it. */
+function createSyncRunCommand(): Command {
+  return new Command('run')
+    .description('Send the pending analytics report to the webhook now')
+    .addOption(new Option('--scheduled').hideHelp())
     .action(async () => {
       const { runSync, realSyncDeps } = await import('./sync/run-sync.js');
       process.exitCode = await runSync(realSyncDeps());
+    });
+}
+
+/** `codemie analytics sync uninstall` — removes the OS job and the settings holding the
+ * webhook. The last-sent marker and the run log are kept. */
+function createSyncUninstallCommand(): Command {
+  return new Command('uninstall')
+    .description('Developer: remove the delivery job and its settings from this machine')
+    .action(async () => {
+      const { runUninstall, createRealUninstallDeps } = await import('./sync/uninstall.js');
+      process.exitCode = await runUninstall(createRealUninstallDeps());
     });
 }
 

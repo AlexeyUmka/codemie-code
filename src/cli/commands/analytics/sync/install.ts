@@ -18,7 +18,8 @@ import { existsSync } from 'fs';
 import { ConfigLoader } from '@/utils/config.js';
 import { getCodemiePath } from '@/utils/paths.js';
 
-import { DEFAULT_LOOKBACK_DAYS, deleteSyncSettings, validateInstallOptions, writeSyncSettings } from './config-store.js';
+import { deleteSyncSettings, validateInstallOptions, writeSyncSettings } from './config-store.js';
+import { lookbackText, webhookHost } from './format.js';
 import { EMAIL_REGEX, realIdentityDeps, resolveSyncIdentity } from './identity.js';
 import { errorMessage, redactSecrets } from './redact.js';
 import { createRealSchedulerDeps, createScheduler, resolveJobCommand } from './scheduler/index.js';
@@ -42,22 +43,6 @@ export interface InstallDeps {
   collectorDirExists(): boolean;
   resolveJobCommand(): Promise<JobCommand>;
   print(line: string): void;
-}
-
-function lookbackText(settings: SyncSettings): string {
-  return settings.lookbackDays === undefined
-    ? `${DEFAULT_LOOKBACK_DAYS} days (default)`
-    : `${settings.lookbackDays} days`;
-}
-
-/** Host only — the signature-bearing query string never reaches output. Falls back to a
- * redacted form of the raw URL on the (validated-away) chance it isn't parseable. */
-function webhookHost(webhookUrl: string): string {
-  try {
-    return new URL(webhookUrl).host;
-  } catch {
-    return redactSecrets(webhookUrl);
-  }
 }
 
 function printSummary(

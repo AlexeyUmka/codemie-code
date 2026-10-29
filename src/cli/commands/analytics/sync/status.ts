@@ -18,9 +18,10 @@ import { readFile } from 'fs/promises';
 import { getCodemiePath } from '@/utils/paths.js';
 import { SyncTargetMissingError } from '@/utils/errors.js';
 
-import { DEFAULT_LOOKBACK_DAYS, loadSyncSettings } from './config-store.js';
+import { loadSyncSettings } from './config-store.js';
+import { lookbackText, webhookHost } from './format.js';
 import { readMarker } from './marker.js';
-import { errorMessage, redactSecrets } from './redact.js';
+import { errorMessage } from './redact.js';
 import { createRealSchedulerDeps, createScheduler } from './scheduler/index.js';
 import type { SyncSettings } from './types.js';
 
@@ -86,21 +87,6 @@ function describeOutcome(outcome: string): string {
 
 function lastRunText(lastRun: LastRun | null): string {
   return lastRun === null ? 'never' : `${lastRun.at} — ${describeOutcome(lastRun.outcome)}`;
-}
-
-function lookbackText(settings: SyncSettings): string {
-  return settings.lookbackDays === undefined
-    ? `${DEFAULT_LOOKBACK_DAYS} days (default)`
-    : `${settings.lookbackDays} days`;
-}
-
-/** Host only — the signature-bearing query string never reaches output. */
-function webhookHost(webhookUrl: string): string {
-  try {
-    return new URL(webhookUrl).host;
-  } catch {
-    return redactSecrets(webhookUrl);
-  }
 }
 
 export async function runStatus(deps: StatusDeps): Promise<number> {
