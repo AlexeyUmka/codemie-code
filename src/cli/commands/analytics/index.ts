@@ -7,8 +7,8 @@ import chalk from 'chalk';
 import inquirer from 'inquirer';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { AnalyticsAggregator } from './aggregator.js';
 import { AnalyticsFormatter } from './formatter.js';
+import { loadAnalytics } from './analytics-core.js';
 import type { AnalyticsOptions, AnalyticsFilter, OtelCommandOptions } from './types.js';
 import type { ExportFormat } from './report/output-target.js';
 import { logger } from '../../../utils/logger.js';
@@ -133,40 +133,21 @@ export async function runAnalytics(options: AnalyticsOptions, source: AnalyticsS
     }
 
     const filter = parseFilterOptions(options);
-    const { rawSessions, cost } = await source.load({
-      filter,
-      includeExternal: options.includeExternal
-    });
+    const loaded = await loadAnalytics(source, filter, options.includeExternal, !options.verbose);
 
-    if (rawSessions.length === 0) {
+    if (loaded.kind === 'empty-raw') {
       console.log(chalk.yellow('\nNo sessions found matching the specified criteria.'));
       console.log(chalk.dim('Run with different filters or check that metrics are being collected.\n'));
       return;
     }
 
-    // Cost computed BEFORE aggregation so zero-delta sessions that still carry real usage are
-    // retained instead of dropped as "empty". Authoritative from the source (OTEL) when present;
-    // otherwise always enriched from correlated native logs. Both branches populate the same
-    // shape, so `costResult` narrows without a throw or a non-null assertion.
-    let costResult: NonNullable<typeof cost>;
-    if (cost) {
-      costResult = cost;
-    } else {
-      const { enrichCosts, realDeps } = await import('./cost/cost-enricher.js');
-      costResult = await enrichCosts(rawSessions, realDeps);
-    }
-    const keepSessionIds = new Set(
-      [...costResult.index.values()].filter((c) => c.tokens.total > 0).map((c) => c.sessionId)
-    );
-
-    // Aggregate data (normalize models unless --verbose flag is set)
-    const analytics = AnalyticsAggregator.aggregate(rawSessions, !options.verbose, keepSessionIds);
-
-    if (analytics.totalSessions === 0) {
+    if (loaded.kind === 'empty-aggregate') {
       console.log(chalk.yellow('\nNo analytics data available.'));
       console.log(chalk.dim('Metrics collection may not have been enabled for these sessions.\n'));
       return;
     }
+
+    const { analytics, costResult } = loaded;
 
     // Display results
     const formatter = new AnalyticsFormatter(options.verbose);
