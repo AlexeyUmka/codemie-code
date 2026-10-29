@@ -42,19 +42,21 @@ describe('error classes', () => {
     expect(err).toBeInstanceOf(CodeMieError);
   });
 
-  it('SyncTargetMissingError names the config command', () => {
+  it('SyncTargetMissingError names the install command, not sync config', () => {
     const err = new SyncTargetMissingError();
     expect(err.name).toBe('SyncTargetMissingError');
     expect(err).toBeInstanceOf(CodeMieError);
-    expect(err.message).toContain('codemie analytics sync config --webhook-url');
+    expect(err.message).toContain('codemie analytics sync install');
+    expect(err.message).not.toContain('sync config');
   });
 
-  it('SyncIdentityMissingError names both the config command and git config', () => {
+  it('SyncIdentityMissingError names both the install command and git config, not sync config', () => {
     const err = new SyncIdentityMissingError();
     expect(err.name).toBe('SyncIdentityMissingError');
     expect(err).toBeInstanceOf(CodeMieError);
-    expect(err.message).toContain('codemie analytics sync config --email');
+    expect(err.message).toContain('codemie analytics sync install');
     expect(err.message).toContain('git config --global user.email');
+    expect(err.message).not.toContain('sync config');
   });
 
   it('SyncDeliveryError has the expected name and optional status', () => {

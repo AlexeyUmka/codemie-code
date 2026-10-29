@@ -1,70 +1,66 @@
 /**
- * "Last sent" markers for `codemie analytics sync`.
+ * "Last sent" marker for `codemie analytics sync` — collector-compatible.
  *
- * One marker file per target at `<dir>/<targetId>.last-sent`, holding an ISO timestamp.
- * The file is written mode `0o600` and re-chmod'd after the write (same pattern as
- * `config-store.ts`), since the marker records when data last left the machine.
+ * A single file at `getCodemiePath('analytics-last-sent')` (no per-target markers), mode
+ * `0o600`, re-chmod'd after every write, since the marker records when data last left the
+ * machine. Content is an ISO timestamp, matching the standalone collector's marker so a
+ * collector-written marker is honoured by the first CLI run.
  *
- * `readMarker` never throws: a missing file, unparseable content, or a timestamp in the
- * future relative to the injected `now` all resolve to `null` so a corrupt marker can
- * never block a sync run.
+ * `readMarker` falls back to the file's mtime — same as the collector — when the content is
+ * empty or not a valid timestamp, and returns `null` (treated as absent) when the resolved
+ * timestamp lies in the future relative to the injected `now`, or when the file does not
+ * exist.
  */
 
-import { chmod, mkdir, readFile, writeFile } from 'fs/promises';
+import { chmod, mkdir, readFile, stat, writeFile } from 'fs/promises';
+import { dirname } from 'path';
 
 import { getCodemiePath } from '@/utils/paths.js';
 
 const MARKER_FILE_MODE = 0o600;
 
-function defaultMarkerDir(): string {
-  return getCodemiePath('analytics', 'sync', 'markers');
-}
-
-function markerPath(targetId: string, dir: string): string {
-  return `${dir}/${targetId}.last-sent`;
+function defaultMarkerPath(): string {
+  return getCodemiePath('analytics-last-sent');
 }
 
 /**
- * Read the "last sent" marker for `targetId`.
+ * Read the "last sent" marker.
  *
- * Returns `null` when the marker file is missing, its content is not a valid ISO
- * timestamp, or the parsed date lies in the future relative to `now`.
+ * Missing file -> `null`. Empty or unparseable content -> the file's mtime (collector
+ * behaviour). A resolved timestamp later than `now` -> `null` (treated as absent).
  */
-export async function readMarker(
-  targetId: string,
-  now: Date,
-  dir: string = defaultMarkerDir()
-): Promise<Date | null> {
+export async function readMarker(now: Date, path: string = defaultMarkerPath()): Promise<Date | null> {
   let raw: string;
   try {
-    raw = await readFile(markerPath(targetId, dir), 'utf-8');
-  } catch {
-    return null;
+    raw = await readFile(path, 'utf-8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      return null;
+    }
+    throw err;
   }
 
   const trimmed = raw.trim();
-  const parsed = new Date(trimmed);
-  if (Number.isNaN(parsed.getTime())) {
+  let resolved: Date;
+  if (trimmed === '') {
+    resolved = (await stat(path)).mtime;
+  } else {
+    const parsed = new Date(trimmed);
+    resolved = Number.isNaN(parsed.getTime()) ? (await stat(path)).mtime : parsed;
+  }
+
+  if (resolved.getTime() > now.getTime()) {
     return null;
   }
 
-  if (parsed.getTime() > now.getTime()) {
-    return null;
-  }
-
-  return parsed;
+  return resolved;
 }
 
 /**
- * Write the "last sent" marker for `targetId` as an ISO timestamp, mode `0o600`.
+ * Write the "last sent" marker as an ISO timestamp, mode `0o600`.
  */
-export async function writeMarker(
-  targetId: string,
-  at: Date,
-  dir: string = defaultMarkerDir()
-): Promise<void> {
-  const path = markerPath(targetId, dir);
-  await mkdir(dir, { recursive: true });
+export async function writeMarker(at: Date, path: string = defaultMarkerPath()): Promise<void> {
+  await mkdir(dirname(path), { recursive: true });
   await writeFile(path, at.toISOString(), { mode: MARKER_FILE_MODE });
   await chmod(path, MARKER_FILE_MODE);
 }

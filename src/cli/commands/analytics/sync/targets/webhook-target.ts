@@ -9,15 +9,15 @@
 
 import { ExportTooLargeError, SyncDeliveryError } from '../../../../../utils/errors.js';
 import { errorMessage } from '../redact.js';
-import type { SyncReport, SyncTarget, SyncTargetType } from '../types.js';
+import type { SyncReport } from '../types.js';
 
 export const MAX_EXPORT_BYTES = 70_000_000;
 
 const defaultFetch: typeof fetch = (...args: Parameters<typeof fetch>) => fetch(...args);
 
-export class WebhookTarget implements SyncTarget {
+/** POSTs the analytics export to one webhook URL. Implements `SyncDeliveryTarget` from `run-sync.ts`. */
+export class WebhookTarget {
   readonly id = 'webhook';
-  readonly type: SyncTargetType = 'webhook';
 
   constructor(
     private readonly url: string,

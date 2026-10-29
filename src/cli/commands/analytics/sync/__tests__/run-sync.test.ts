@@ -6,8 +6,8 @@ import { describe, expect, it, vi } from 'vitest';
 import { SyncDeliveryError, SyncIdentityMissingError } from '@/utils/errors.js';
 
 import { runSync } from '../run-sync.js';
-import type { SyncDeps } from '../run-sync.js';
-import type { SyncConfig, SyncReport, SyncTarget } from '../types.js';
+import type { SyncDeliveryTarget, SyncDeps } from '../run-sync.js';
+import type { SyncReport, SyncSettings } from '../types.js';
 import type { AnalyticsSource } from '../../sources/types.js';
 
 const HOUR_MS = 60 * 60 * 1000;
@@ -16,14 +16,15 @@ const DAY_MS = 24 * HOUR_MS;
 const NOW = new Date('2026-10-29T00:00:00.000Z');
 const REPORT: SyncReport = { fileName: 'report.json', bytes: Buffer.from('{"a":1}') };
 
-const BASE_CONFIG: SyncConfig = {
-  targets: { webhook: { url: 'https://example.invalid/hook?sig=FAKE' } },
+const BASE_SETTINGS: SyncSettings = {
+  webhookUrl: 'https://example.invalid/hook?sig=FAKE',
   includeExternal: 'windows',
+  at: '03:00',
   lookbackDays: 7,
 };
 
-function fakeTarget(id: string, deliver: (report: SyncReport) => Promise<void>): SyncTarget {
-  return { id, type: 'webhook', deliver };
+function fakeTarget(deliver: (report: SyncReport) => Promise<void>): SyncDeliveryTarget {
+  return { deliver };
 }
 
 /** Real temp dir/removal so the (non-injected) report write in `runSync` lands somewhere real. */
@@ -47,9 +48,9 @@ function makeDeps(overrides: Partial<SyncDeps> = {}): Harness {
 
   const deps: SyncDeps = {
     now: () => NOW,
-    loadConfig: async () => BASE_CONFIG,
+    loadSettings: async () => BASE_SETTINGS,
     resolveIdentity: async () => 'dev@example.invalid',
-    createTargets: (cfg) => (cfg.targets.webhook ? [fakeTarget('webhook', async () => {})] : []),
+    createTarget: () => fakeTarget(async () => {}),
     buildReport: async () => REPORT,
     readMarker: async () => null,
     writeMarker: async () => {},
@@ -81,13 +82,13 @@ describe('runSync', () => {
       readMarker,
       writeMarker,
       buildReport,
-      createTargets: (cfg) => (cfg.targets.webhook ? [fakeTarget('webhook', deliver)] : []),
+      createTarget: () => fakeTarget(deliver),
     });
 
     const code = await runSync({}, deps);
 
     expect(code).toBe(0);
-    expect(readMarker).toHaveBeenCalledWith('webhook', NOW);
+    expect(readMarker).toHaveBeenCalledWith(NOW);
 
     const passedWindow = buildReport.mock.calls[0]?.[0]?.window;
     expect(passedWindow.to).toEqual(NOW);
@@ -95,7 +96,7 @@ describe('runSync', () => {
     expect(passedWindow.backfill).toBe(false);
 
     expect(deliver).toHaveBeenCalledTimes(1);
-    expect(writeMarker).toHaveBeenCalledWith('webhook', NOW);
+    expect(writeMarker).toHaveBeenCalledWith(NOW);
   });
 
   it('AC3: a failing delivery returns 1, leaves the marker unchanged, and still removes the temp dir', async () => {
@@ -108,7 +109,7 @@ describe('runSync', () => {
     const { deps, printed, logged } = makeDeps({
       writeMarker,
       removeDir,
-      createTargets: (cfg) => (cfg.targets.webhook ? [fakeTarget('webhook', deliver)] : []),
+      createTarget: () => fakeTarget(deliver),
     });
 
     const code = await runSync({}, deps);
@@ -128,7 +129,7 @@ describe('runSync', () => {
     const { deps, printed, logged } = makeDeps({
       buildReport,
       writeMarker,
-      createTargets: (cfg) => (cfg.targets.webhook ? [fakeTarget('webhook', deliver)] : []),
+      createTarget: () => fakeTarget(deliver),
     });
 
     const code = await runSync({}, deps);
@@ -140,7 +141,7 @@ describe('runSync', () => {
     expect(logged.some((line) => line.startsWith('skip webhook'))).toBe(true);
   });
 
-  it('AC5: no resolvable email fails without building a report and names --email', async () => {
+  it('AC5: no resolvable identity fails without building a report, naming the install command', async () => {
     const buildReport = vi.fn(async () => REPORT);
 
     const { deps, printed, logged } = makeDeps({
@@ -154,8 +155,8 @@ describe('runSync', () => {
 
     expect(code).toBe(1);
     expect(buildReport).not.toHaveBeenCalled();
-    expect(printed.some((line) => line.includes('--email'))).toBe(true);
-    expect(logged.some((line) => line.includes('--email'))).toBe(true);
+    expect(printed.some((line) => line.includes('codemie analytics sync install'))).toBe(true);
+    expect(logged.some((line) => line.includes('codemie analytics sync install'))).toBe(true);
   });
 
   it('AC6: a backfill (--last) never reads or writes any marker', async () => {
@@ -166,7 +167,7 @@ describe('runSync', () => {
     const { deps } = makeDeps({
       readMarker,
       writeMarker,
-      createTargets: (cfg) => (cfg.targets.webhook ? [fakeTarget('webhook', deliver)] : []),
+      createTarget: () => fakeTarget(deliver),
     });
 
     const code = await runSync({ last: '30d' }, deps);
@@ -177,16 +178,16 @@ describe('runSync', () => {
     expect(deliver).toHaveBeenCalledTimes(1);
   });
 
-  it('AC7: no configured target fails and names --webhook-url', async () => {
+  it('AC7: no installed settings fails and names --webhook', async () => {
     const { deps, printed, logged } = makeDeps({
-      createTargets: () => [],
+      loadSettings: async () => null,
     });
 
     const code = await runSync({}, deps);
 
     expect(code).toBe(1);
-    expect(printed.some((line) => line.includes('--webhook-url'))).toBe(true);
-    expect(logged.some((line) => line.includes('--webhook-url'))).toBe(true);
+    expect(printed.some((line) => line.includes('--webhook'))).toBe(true);
+    expect(logged.some((line) => line.includes('--webhook'))).toBe(true);
   });
 
   it('AC8: a delivery error carrying a signed URL never leaks sig into printed or logged lines', async () => {
@@ -195,7 +196,7 @@ describe('runSync', () => {
     });
 
     const { deps, printed, logged } = makeDeps({
-      createTargets: (cfg) => (cfg.targets.webhook ? [fakeTarget('webhook', deliver)] : []),
+      createTarget: () => fakeTarget(deliver),
     });
 
     const code = await runSync({}, deps);
@@ -213,7 +214,7 @@ describe('runSync', () => {
 
     const { deps } = makeDeps({
       removeDir,
-      createTargets: (cfg) => (cfg.targets.webhook ? [fakeTarget('webhook', deliver)] : []),
+      createTarget: () => fakeTarget(deliver),
     });
 
     await runSync({}, deps);
@@ -221,12 +222,12 @@ describe('runSync', () => {
     expect(removeDir).toHaveBeenCalledTimes(1);
   });
 
-  it('no configured target returns 1 without creating or removing a temp dir', async () => {
+  it('no installed settings returns 1 without creating or removing a temp dir', async () => {
     const makeTempDir = vi.fn(realMakeTempDir);
     const removeDir = vi.fn(realRemoveDir);
 
     const { deps } = makeDeps({
-      createTargets: () => [],
+      loadSettings: async () => null,
       makeTempDir,
       removeDir,
     });

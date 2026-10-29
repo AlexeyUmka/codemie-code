@@ -56,7 +56,7 @@ export class SyncConfigError extends ConfigurationError {
 
 export class SyncTargetMissingError extends CodeMieError {
   constructor() {
-    super('No sync target configured. Run: codemie analytics sync config --webhook-url <url>');
+    super('No sync target configured. Run: codemie analytics sync install --webhook <url>');
     this.name = 'SyncTargetMissingError';
   }
 }
@@ -64,7 +64,7 @@ export class SyncTargetMissingError extends CodeMieError {
 export class SyncIdentityMissingError extends CodeMieError {
   constructor() {
     super(
-      'No sync identity configured. Run: codemie analytics sync config --email <email>, or set git config --global user.email'
+      'No sync identity configured. Run: codemie analytics sync install, or set git config --global user.email'
     );
     this.name = 'SyncIdentityMissingError';
   }

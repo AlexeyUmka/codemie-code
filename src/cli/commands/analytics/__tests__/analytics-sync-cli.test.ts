@@ -1,40 +1,27 @@
 /**
- * CLI wiring tests for `codemie analytics sync` and `codemie analytics sync config`
- * (EPMCDME-16554, Task 8).
+ * CLI wiring tests for `codemie analytics sync` (EPMCDME-16554, Task 8; adapted for
+ * EPMCDME-16488 Task 1).
+ *
+ * `sync config` (and the `applySyncUpdate`/`loadSyncConfig` config-store API it used) was
+ * removed as part of moving sync state onto the collector-compatible store
+ * (`sync/config-store.ts`, `sync/marker.ts`). A later task in the EPMCDME-16488 plan
+ * rebuilds `sync` onto `install`/`status`/`run`/`uninstall`; for now this file only covers
+ * what still exists: `sync` forwarding its backfill flags to `runSync`/`realSyncDeps`.
  *
  * Covers:
  *  - `sync` forwards --from/--to/--last to `runSync`/`realSyncDeps`, exit code is runSync's
  *    return value.
- *  - `sync config` forwards flag values to `applySyncUpdate`.
- *  - `sync config --email` validates with the same regex as the interactive prompt before
- *    anything is saved; an invalid email saves nothing and sets exitCode 1.
- *  - the parent's boolean `--include-external` does not swallow `sync config
- *    --include-external <mode>`'s value, and `analytics otel --file f --from <date>` and
- *    plain `analytics --include-external` still work.
+ *  - the parent's boolean `--include-external` and `analytics otel --file f --from <date>`
+ *    still work (regression for `.enablePositionalOptions()`).
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-
-const applySyncUpdateMock = vi.fn();
-const loadSyncConfigMock = vi.fn();
-vi.mock('../sync/config-store.js', () => ({
-  applySyncUpdate: (...a: unknown[]) => applySyncUpdateMock(...a),
-  loadSyncConfig: (...a: unknown[]) => loadSyncConfigMock(...a),
-}));
 
 const runSyncMock = vi.fn();
 const realSyncDepsMock = vi.fn();
 vi.mock('../sync/run-sync.js', () => ({
   runSync: (...a: unknown[]) => runSyncMock(...a),
   realSyncDeps: (...a: unknown[]) => realSyncDepsMock(...a),
-}));
-
-const saveUserEmailMock = vi.fn();
-vi.mock('../../../../utils/config.js', () => ({
-  ConfigLoader: {
-    saveUserEmail: (...a: unknown[]) => saveUserEmailMock(...a),
-    loadMultiProviderConfig: vi.fn().mockResolvedValue({ userEmail: undefined }),
-  },
 }));
 
 const loadAnalyticsMock = vi.fn();
@@ -82,106 +69,14 @@ describe('analytics sync CLI wiring', () => {
   });
 });
 
-describe('analytics sync config CLI wiring', () => {
+describe('--include-external scoping across analytics / sync (regression)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    applySyncUpdateMock.mockResolvedValue({
-      targets: {},
-      includeExternal: 'windows',
-      lookbackDays: 7,
-    });
-  });
-
-  afterEach(() => {
-    process.exitCode = undefined;
-  });
-
-  it('passes includeExternal and lookbackDays through to applySyncUpdate', async () => {
-    await parse(['sync', 'config', '--include-external', 'always', '--lookback-days', '14']);
-
-    expect(applySyncUpdateMock).toHaveBeenCalledWith(
-      expect.objectContaining({ includeExternal: 'always', lookbackDays: '14' })
-    );
-    expect(saveUserEmailMock).not.toHaveBeenCalled();
-    expect(process.exitCode).toBeUndefined();
-  });
-
-  it('passes webhookUrl through to applySyncUpdate', async () => {
-    await parse(['sync', 'config', '--webhook-url', 'https://example.invalid/hook?sig=FAKE']);
-
-    expect(applySyncUpdateMock).toHaveBeenCalledWith(
-      expect.objectContaining({ webhookUrl: 'https://example.invalid/hook?sig=FAKE' })
-    );
-  });
-
-  it('saves a valid --email via ConfigLoader.saveUserEmail, after applySyncUpdate', async () => {
-    await parse(['sync', 'config', '--email', 'dev@example.com']);
-
-    expect(applySyncUpdateMock).toHaveBeenCalled();
-    expect(saveUserEmailMock).toHaveBeenCalledWith('dev@example.com');
-    expect(process.exitCode).toBeUndefined();
-  });
-
-  it('rejects an invalid --email, saving nothing and setting exitCode 1', async () => {
-    await parse(['sync', 'config', '--email', 'not-an-email', '--lookback-days', '14']);
-
-    expect(applySyncUpdateMock).not.toHaveBeenCalled();
-    expect(saveUserEmailMock).not.toHaveBeenCalled();
-    expect(process.exitCode).toBe(1);
-  });
-
-  it('prints the redacted message and sets exitCode 1 when applySyncUpdate throws a CodeMieError', async () => {
-    const { SyncConfigError } = await import('../../../../utils/errors.js');
-    applySyncUpdateMock.mockRejectedValue(new SyncConfigError('Webhook URL must use https: https://x?sig=secret-token'));
-    const logSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
-
-    try {
-      await parse(['sync', 'config', '--webhook-url', 'http://example.invalid']);
-
-      expect(process.exitCode).toBe(1);
-      const printed = logSpy.mock.calls.map((c) => c.join(' ')).join('\n');
-      expect(printed).toContain('sig=REDACTED');
-      expect(printed).not.toContain('secret-token');
-    } finally {
-      logSpy.mockRestore();
-    }
-  });
-
-  it('prints the current effective config (redacting the webhook URL) when no flags are given', async () => {
-    loadSyncConfigMock.mockResolvedValue({
-      targets: { webhook: { url: 'https://example.invalid/hook?sig=FAKE' } },
-      includeExternal: 'windows',
-      lookbackDays: 7,
-    });
-    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
-
-    try {
-      await parse(['sync', 'config']);
-
-      expect(applySyncUpdateMock).not.toHaveBeenCalled();
-      const printed = logSpy.mock.calls.map((c) => c.join(' ')).join('\n');
-      expect(printed).toContain('sig=REDACTED');
-      expect(printed).not.toContain('sig=FAKE');
-    } finally {
-      logSpy.mockRestore();
-    }
-  });
-});
-
-describe('--include-external scoping across analytics / sync / config (regression)', () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    applySyncUpdateMock.mockResolvedValue({ targets: {}, includeExternal: 'windows', lookbackDays: 7 });
     loadAnalyticsMock.mockResolvedValue({ kind: 'empty-raw' });
   });
 
   afterEach(() => {
     process.exitCode = undefined;
-  });
-
-  it('"sync config --include-external always" reaches config, not the parent boolean flag', async () => {
-    await parse(['sync', 'config', '--include-external', 'always']);
-    expect(applySyncUpdateMock).toHaveBeenCalledWith(expect.objectContaining({ includeExternal: 'always' }));
   });
 
   it('"analytics otel --file f --from 2026-10-01" still receives --from', async () => {

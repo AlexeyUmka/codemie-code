@@ -2,27 +2,32 @@
  * Shared types for `codemie analytics sync`.
  */
 
-export type SyncTargetType = 'webhook';
-
 export interface SyncReport {
   fileName: string;
   bytes: Buffer;
 }
 
-export interface SyncTarget {
-  readonly id: string;
-  readonly type: SyncTargetType;
-  deliver(report: SyncReport): Promise<void>;
-}
-
 export type IncludeExternalPolicy = 'windows' | 'always' | 'never';
 
-export interface SyncConfig {
-  targets: {
-    webhook?: { url: string };
-  };
+/**
+ * Persisted sync settings, `getSyncSettingsPath()` (collector-compatible
+ * `~/.codemie/analytics-sync.json`). `lookbackDays` is present only when the install
+ * command was given `--lookback-days` explicitly, so the default (7) tracks CLI updates
+ * instead of being baked into the file.
+ */
+export interface SyncSettings {
+  webhookUrl: string;
   includeExternal: IncludeExternalPolicy;
-  lookbackDays: number;
+  at: string;
+  lookbackDays?: number;
+}
+
+/** Raw flags accepted by `codemie analytics sync install`. */
+export interface InstallOptions {
+  webhook?: string;
+  at?: string;
+  lookbackDays?: string;
+  includeExternal?: string;
 }
 
 export type SyncStatus = 'ok' | 'skip' | 'fail';

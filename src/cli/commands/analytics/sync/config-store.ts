@@ -1,66 +1,140 @@
 /**
- * Config store for `codemie analytics sync`.
+ * Settings store for `codemie analytics sync`.
  *
- * Reads and writes `SyncConfig` at `getCodemiePath('analytics', 'sync', 'config.json')`.
- * The webhook URL is a secret-bearing value, so the file is always written mode `0o600`
- * and re-chmod'd after every write. All update values are validated before any write
- * happens, so a rejected update never touches the file system.
+ * Reads and writes `SyncSettings` at `getSyncSettingsPath()` — the collector-compatible
+ * `~/.codemie/analytics-sync.json`. The webhook URL is a secret-bearing value, so the file
+ * is always written mode `0o600` and re-chmod'd after every write. `install` always
+ * overwrites the file wholesale (even a pre-existing collector settings file with a
+ * different shape), so there is no merge-with-existing-file path here.
  */
 
-import { chmod, mkdir, readFile, writeFile } from 'fs/promises';
+import { chmod, mkdir, readFile, unlink, writeFile } from 'fs/promises';
 import { dirname } from 'path';
 
 import { getCodemiePath } from '@/utils/paths.js';
 import { SyncConfigError } from '@/utils/errors.js';
 
 import { redactSecrets } from './redact.js';
-import type { IncludeExternalPolicy, SyncConfig } from './types.js';
+import type { IncludeExternalPolicy, InstallOptions, SyncSettings } from './types.js';
 
+export const DEFAULT_LOOKBACK_DAYS = 7;
+export const DEFAULT_AT = '03:00';
 const DEFAULT_INCLUDE_EXTERNAL: IncludeExternalPolicy = 'windows';
-const DEFAULT_LOOKBACK_DAYS = 7;
+
+const SETTINGS_FILE_MODE = 0o600;
 const MIN_LOOKBACK_DAYS = 1;
 const MAX_LOOKBACK_DAYS = 30;
-const CONFIG_FILE_MODE = 0o600;
 
 const INCLUDE_EXTERNAL_VALUES: readonly IncludeExternalPolicy[] = ['windows', 'always', 'never'];
 const INTEGER_PATTERN = /^\d+$/;
+const AT_PATTERN = /^([01]\d|2[0-3]):[0-5]\d$/;
 
-/** Partial update to a `SyncConfig`, as raw CLI flag strings. */
-export interface SyncConfigUpdate {
-  webhookUrl?: string;
-  includeExternal?: string;
-  lookbackDays?: string;
+/** Absolute path to the sync settings file. */
+export function getSyncSettingsPath(): string {
+  return getCodemiePath('analytics-sync.json');
 }
 
-/** Absolute path to the sync config file. */
-export function getSyncConfigPath(): string {
-  return getCodemiePath('analytics', 'sync', 'config.json');
+function validateWebhookUrl(webhook: string | undefined): string {
+  if (webhook === undefined || webhook.trim() === '') {
+    throw new SyncConfigError('--webhook is required: pass the https:// URL the daily report is delivered to.');
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(webhook);
+  } catch {
+    throw new SyncConfigError(`Invalid --webhook URL: ${redactSecrets(webhook)}`);
+  }
+
+  if (parsed.protocol !== 'https:') {
+    throw new SyncConfigError(`--webhook must use https: ${redactSecrets(webhook)}`);
+  }
+
+  return webhook;
 }
 
-function defaultSyncConfig(): SyncConfig {
+function validateAt(at: string | undefined): string {
+  if (at === undefined) {
+    return DEFAULT_AT;
+  }
+
+  if (!AT_PATTERN.test(at)) {
+    throw new SyncConfigError(`Invalid --at "${at}". Expected 24-hour HH:MM, e.g. "03:00".`);
+  }
+
+  return at;
+}
+
+function validateIncludeExternal(includeExternal: string | undefined): IncludeExternalPolicy {
+  if (includeExternal === undefined) {
+    return DEFAULT_INCLUDE_EXTERNAL;
+  }
+
+  if (!INCLUDE_EXTERNAL_VALUES.includes(includeExternal as IncludeExternalPolicy)) {
+    throw new SyncConfigError(
+      `Invalid --include-external "${includeExternal}". Expected one of: ${INCLUDE_EXTERNAL_VALUES.join(', ')}.`
+    );
+  }
+
+  return includeExternal as IncludeExternalPolicy;
+}
+
+function validateLookbackDays(lookbackDays: string | undefined): number | undefined {
+  if (lookbackDays === undefined) {
+    return undefined;
+  }
+
+  if (!INTEGER_PATTERN.test(lookbackDays)) {
+    throw new SyncConfigError(`Invalid --lookback-days "${lookbackDays}". Expected an integer 1-30.`);
+  }
+
+  const parsed = Number(lookbackDays);
+  if (parsed < MIN_LOOKBACK_DAYS || parsed > MAX_LOOKBACK_DAYS) {
+    throw new SyncConfigError(`--lookback-days "${lookbackDays}" is out of range. Expected 1-30.`);
+  }
+
+  return parsed;
+}
+
+/**
+ * Validate raw `install` CLI flags into a `SyncSettings`. Performs no I/O. Throws
+ * `SyncConfigError` naming the offending flag on the first invalid value.
+ *
+ * `lookbackDays` is included on the result only when `--lookback-days` was given, so the
+ * default ({@link DEFAULT_LOOKBACK_DAYS}) is applied at read time rather than persisted —
+ * a later default change then applies to settings written without the flag.
+ */
+export function validateInstallOptions(options: InstallOptions): SyncSettings {
+  const webhookUrl = validateWebhookUrl(options.webhook);
+  const at = validateAt(options.at);
+  const includeExternal = validateIncludeExternal(options.includeExternal);
+  const lookbackDays = validateLookbackDays(options.lookbackDays);
+
   return {
-    targets: {},
-    includeExternal: DEFAULT_INCLUDE_EXTERNAL,
-    lookbackDays: DEFAULT_LOOKBACK_DAYS
+    webhookUrl,
+    includeExternal,
+    at,
+    ...(lookbackDays !== undefined && { lookbackDays })
   };
 }
 
 /**
- * Load the sync config from `path` (defaults to `getSyncConfigPath()`).
+ * Load sync settings from `path` (defaults to `getSyncSettingsPath()`).
  *
- * A missing file returns the defaults with `targets: {}`. Malformed JSON, or JSON that is
- * not an object, throws `SyncConfigError`. Never reads any `ANALYTICS_*` environment variable.
+ * A missing file returns `null`. Malformed JSON, JSON that is not an object, or JSON
+ * missing a usable `webhookUrl` throws `SyncConfigError`. Never reads any `ANALYTICS_*`
+ * environment variable.
  */
-export async function loadSyncConfig(path: string = getSyncConfigPath()): Promise<SyncConfig> {
+export async function loadSyncSettings(path: string = getSyncSettingsPath()): Promise<SyncSettings | null> {
   let raw: string;
   try {
     raw = await readFile(path, 'utf-8');
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-      return defaultSyncConfig();
+      return null;
     }
     throw new SyncConfigError(
-      `Failed to read sync config at ${path}: ${redactSecrets(err instanceof Error ? err.message : String(err))}`
+      `Failed to read sync settings at ${path}: ${redactSecrets(err instanceof Error ? err.message : String(err))}`
     );
   }
 
@@ -68,106 +142,57 @@ export async function loadSyncConfig(path: string = getSyncConfigPath()): Promis
   try {
     parsed = JSON.parse(raw);
   } catch {
-    throw new SyncConfigError(`Sync config at ${path} is not valid JSON.`);
+    throw new SyncConfigError(`Sync settings at ${path} is not valid JSON.`);
   }
 
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-    throw new SyncConfigError(`Sync config at ${path} must be a JSON object.`);
+    throw new SyncConfigError(`Sync settings at ${path} must be a JSON object.`);
   }
 
-  const stored = parsed as Partial<SyncConfig>;
-  return {
-    targets: stored.targets ?? {},
+  const stored = parsed as Partial<SyncSettings>;
+  if (typeof stored.webhookUrl !== 'string' || stored.webhookUrl.trim() === '') {
+    throw new SyncConfigError(`Sync settings at ${path} is missing a webhookUrl.`);
+  }
+
+  const settings: SyncSettings = {
+    webhookUrl: stored.webhookUrl,
     includeExternal: stored.includeExternal ?? DEFAULT_INCLUDE_EXTERNAL,
-    lookbackDays: stored.lookbackDays ?? DEFAULT_LOOKBACK_DAYS
+    at: stored.at ?? DEFAULT_AT
   };
-}
 
-function validateWebhookUrl(webhookUrl: string): string {
-  let parsed: URL;
-  try {
-    parsed = new URL(webhookUrl);
-  } catch {
-    throw new SyncConfigError(`Invalid webhook URL: ${redactSecrets(webhookUrl)}`);
+  if (typeof stored.lookbackDays === 'number') {
+    settings.lookbackDays = stored.lookbackDays;
   }
 
-  if (parsed.protocol !== 'https:') {
-    throw new SyncConfigError(`Webhook URL must use https: ${redactSecrets(webhookUrl)}`);
-  }
-
-  return webhookUrl;
-}
-
-function validateIncludeExternal(includeExternal: string): IncludeExternalPolicy {
-  if (!INCLUDE_EXTERNAL_VALUES.includes(includeExternal as IncludeExternalPolicy)) {
-    throw new SyncConfigError(
-      `Invalid includeExternal value "${includeExternal}". Expected one of: ${INCLUDE_EXTERNAL_VALUES.join(', ')}.`
-    );
-  }
-  return includeExternal as IncludeExternalPolicy;
-}
-
-function validateLookbackDays(lookbackDays: string): number {
-  if (!INTEGER_PATTERN.test(lookbackDays)) {
-    throw new SyncConfigError(`Invalid lookbackDays value "${lookbackDays}". Expected an integer 1-30.`);
-  }
-
-  const parsed = Number(lookbackDays);
-  if (parsed < MIN_LOOKBACK_DAYS || parsed > MAX_LOOKBACK_DAYS) {
-    throw new SyncConfigError(`lookbackDays "${lookbackDays}" is out of range. Expected 1-30.`);
-  }
-
-  return parsed;
+  return settings;
 }
 
 /**
- * Validate a `SyncConfigUpdate`, throwing `SyncConfigError` on the first invalid value.
- * Performs no I/O.
- */
-export function validateSyncUpdate(update: SyncConfigUpdate): Partial<SyncConfig> {
-  const result: Partial<SyncConfig> = {};
-
-  if (update.webhookUrl !== undefined) {
-    result.targets = { webhook: { url: validateWebhookUrl(update.webhookUrl) } };
-  }
-
-  if (update.includeExternal !== undefined) {
-    result.includeExternal = validateIncludeExternal(update.includeExternal);
-  }
-
-  if (update.lookbackDays !== undefined) {
-    result.lookbackDays = validateLookbackDays(update.lookbackDays);
-  }
-
-  return result;
-}
-
-/**
- * Validate `update`, merge it into the config loaded from `path` (defaults to
- * `getSyncConfigPath()`), and persist the result mode `0o600`.
+ * Write `settings` to `path` (defaults to `getSyncSettingsPath()`), mode `0o600`.
  *
- * Every value is validated before anything is written: a rejected update leaves the
- * config file untouched (including a missing file staying missing).
+ * Always a whole-file overwrite: a pre-existing file at `path` — including one written by
+ * the standalone collector, with a different shape — is replaced entirely.
  */
-export async function applySyncUpdate(
-  update: SyncConfigUpdate,
-  path: string = getSyncConfigPath()
-): Promise<SyncConfig> {
-  const validated = validateSyncUpdate(update);
-  const current = await loadSyncConfig(path);
-
-  const merged: SyncConfig = {
-    ...current,
-    ...validated,
-    targets: {
-      ...current.targets,
-      ...validated.targets
-    }
-  };
-
+export async function writeSyncSettings(settings: SyncSettings, path: string = getSyncSettingsPath()): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, JSON.stringify(merged, null, 2), { mode: CONFIG_FILE_MODE });
-  await chmod(path, CONFIG_FILE_MODE);
+  await writeFile(path, JSON.stringify(settings, null, 2), { mode: SETTINGS_FILE_MODE });
+  await chmod(path, SETTINGS_FILE_MODE);
+}
 
-  return merged;
+/**
+ * Delete the sync settings file at `path` (defaults to `getSyncSettingsPath()`).
+ *
+ * Returns `false` when the file does not exist (nothing to remove), `true` once the file
+ * is deleted.
+ */
+export async function deleteSyncSettings(path: string = getSyncSettingsPath()): Promise<boolean> {
+  try {
+    await unlink(path);
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      return false;
+    }
+    throw err;
+  }
 }
