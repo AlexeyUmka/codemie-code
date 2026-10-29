@@ -170,7 +170,7 @@ Unified config loader with a fixed priority chain. Supports legacy single-provid
 **Config formats** (`src/utils/config.ts:29`):
 
 Legacy (v1): flat `{ provider, apiKey, model, baseUrl, ... }`.  
-Multi-provider (v2): `{ version: 2, activeProfile: string, profiles: Record<string, CodeMieConfigOptions>, analytics? }`.
+Multi-provider (v2): `{ version: 2, activeProfile: string, profiles: Record<string, CodeMieConfigOptions> }`.
 
 **Profile isolation**: when an explicit profile name is passed via CLI, env vars for `baseUrl`/`apiKey`/`model`/`provider` are filtered out to prevent contamination.
 

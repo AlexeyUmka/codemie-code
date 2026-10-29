@@ -378,3 +378,77 @@ codemie analytics otel --file <path> [options]
 ```
 
 All filter, report, and export flags from the base command also apply to `analytics otel`. The source flag does not: an OTEL events file is not gated on CodeMie ownership, so `--include-external` has no meaning here. Cost is read from each event's native `cost_usd`.
+
+---
+
+## Scheduled upload (`analytics sync`)
+
+`codemie analytics sync` is an unattended, non-interactive counterpart to `codemie analytics --export json`: it builds the same JSON report in-process and delivers it to every configured target (a webhook, today) instead of writing it to disk. It never prompts and never reads any `ANALYTICS_*` environment variable — the config file and CLI flags are the only source of settings.
+
+### Commands
+
+```bash
+# Run one sync against every configured target (recurring/daily use — scheduler-friendly)
+codemie analytics sync
+
+# Backfill a specific period instead of the recurring daily window (never touches markers)
+codemie analytics sync --from 2026-10-01 --to 2026-10-15
+codemie analytics sync --last 7d
+
+# Configure the webhook target, policy and identity (flags only, never prompts)
+codemie analytics sync config --webhook-url https://example.invalid/hook?sig=REDACTED
+codemie analytics sync config --include-external always
+codemie analytics sync config --lookback-days 14
+codemie analytics sync config --email dev@example.com
+
+# Print the current effective config (webhook URL redacted)
+codemie analytics sync config
+```
+
+### `sync` flags
+
+```
+codemie analytics sync [options]
+
+  --from <YYYY-MM-DD>       Backfill: sync sessions from date (inclusive)
+  --to   <YYYY-MM-DD>       Backfill: sync sessions to date (inclusive)
+  --last <duration>         Backfill: sync sessions from last duration (7d, 24h, ...)
+```
+
+With none of `--from`/`--to`/`--last`, `sync` runs the recurring **daily window**: for each target, the larger of `lookbackDays` and (time since that target's last successful send, plus a 1-hour safety margin); with no prior successful send, the window is exactly `lookbackDays` wide. A backfill (any of `--from`/`--to`/`--last` given) uses the requested period for every target and never reads or writes any marker.
+
+### `sync config` flags
+
+```
+codemie analytics sync config [options]
+
+  --webhook-url <https-url>              Webhook URL reports are POSTed to (must be https:)
+  --include-external <windows|always|never>  Include external sessions policy (default: windows)
+  --lookback-days <1-30>                 Daily sync lookback window in days (default: 7)
+  --email <address>                      Developer email used to identify sync uploads
+```
+
+Only the given flags change; omitted flags keep their current value. If any given value is invalid (a non-`https:` webhook URL, an `includeExternal` value other than `windows`/`always`/`never`, a `lookbackDays` outside 1-30, or a malformed `--email`), **nothing is saved** and the command exits 1. `--email` is validated, then saved via the same user-email field the interactive `codemie analytics --export` prompt writes — it is not part of the sync config file. Running `sync config` with no flags at all prints the current effective settings (webhook URL redacted) instead of prompting.
+
+### Preconditions
+
+- **No target configured** — the run fails immediately, naming `codemie analytics sync config --webhook-url`.
+- **No resolvable identity** — the upload is identified by an email, resolved from the saved `userEmail` first, then `git config user.email`. If neither resolves, the run fails, naming `codemie analytics sync config --email` and `git config --global user.email`, and uploads nothing.
+
+### Outcome, exit codes and logging
+
+Each target's result for the run — `ok`, `skip` (no sessions in the window), or `fail` — is printed to the console and appended as one line to the sync log. The run exits `0` when every target is `ok` or `skip`, and `1` when any precondition or target delivery fails. A failed target leaves its marker unchanged, so the next daily run re-sends the missed window; targets are delivered independently, so one failing does not stop the others.
+
+### Paths
+
+| What | Path |
+|---|---|
+| Config | `~/.codemie/analytics/sync/config.json` (mode `600`) |
+| Per-target marker | `~/.codemie/analytics/sync/markers/<targetId>.last-sent` |
+| Run log | `~/.codemie/logs/analytics-sync.log` |
+
+(Resolved via `getCodemiePath(...)` — the actual base directory follows the same resolution as the rest of the CLI's `~/.codemie` state.)
+
+### Secret handling
+
+The webhook URL is a secret-bearing value: every file that holds it (the config file, and any marker/log line that might echo an error containing it) is written mode `600`, re-applied on every overwrite. Every console message, log line and error redacts the URL's `sig` query value as `sig=REDACTED` before it is ever printed or written — including errors from a failed delivery. There are no environment-variable overrides for any of this; the config file and the `sync`/`sync config` flags above are the only inputs.

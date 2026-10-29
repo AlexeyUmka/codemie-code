@@ -17,6 +17,9 @@ import { OtelSource } from './sources/otel-source.js';
 import type { AnalyticsSource } from './sources/types.js';
 import { ConfigLoader } from '../../../utils/config.js';
 import { parseDate, parseDuration } from './date-args.js';
+import { CodeMieError, SyncConfigError } from '../../../utils/errors.js';
+import type { RunSyncOptions } from './sync/run-sync.js';
+import type { SyncConfigUpdate } from './sync/config-store.js';
 
 /**
  * Date on which the deprecated analytics report flags (`--report`, `--report-format`,
@@ -24,9 +27,29 @@ import { parseDate, parseDuration } from './date-args.js';
  */
 const LEGACY_FLAGS_REMOVAL_DATE = 'November 1, 2026';
 
+/**
+ * Same pattern as the interactive email prompt below — hoisted so `analytics sync config
+ * --email` validates identically without duplicating the regex.
+ */
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+/** Raw flags accepted by `codemie analytics sync config`. */
+interface SyncConfigCliOptions {
+  webhookUrl?: string;
+  includeExternal?: string;
+  lookbackDays?: string;
+  email?: string;
+}
+
 export function createAnalyticsCommand(): Command {
   const command = new Command('analytics')
-    .description('Display aggregated metrics and analytics from sessions');
+    .description('Display aggregated metrics and analytics from sessions')
+    // Required so a descendant subcommand can redeclare an option name an ancestor also
+    // defines with different semantics (the parent's boolean --include-external vs. `sync
+    // config`'s value-taking --include-external <mode>) without the ancestor swallowing it:
+    // each level only consumes its own options up to the first non-option argument, then
+    // hands the rest down untouched.
+    .enablePositionalOptions();
 
   // Default source: local CodeMie-tracked sessions + native agent logs.
   applyCommonOptions(command)
@@ -48,7 +71,101 @@ export function createAnalyticsCommand(): Command {
     });
   command.addCommand(otel);
 
+  // `codemie analytics sync` / `codemie analytics sync config` — unattended report upload.
+  command.addCommand(createSyncCommand());
+
   return command;
+}
+
+/**
+ * `codemie analytics sync` — unattended upload of the analytics JSON report to every
+ * configured target. Backfill flags use the same names/formats as the base command.
+ * Never prompts; `runSync` itself never throws and never calls `process.exit`.
+ */
+function createSyncCommand(): Command {
+  const sync = new Command('sync')
+    .description('Unattended upload of the analytics report to every configured target')
+    .option('--from <date>', 'Backfill: sync sessions from date (YYYY-MM-DD)')
+    .option('--to <date>', 'Backfill: sync sessions to date (YYYY-MM-DD)')
+    .option('--last <duration>', 'Backfill: sync sessions from last duration (e.g., 7d, 24h)')
+    .action(async (opts: RunSyncOptions) => {
+      const { runSync, realSyncDeps } = await import('./sync/run-sync.js');
+      process.exitCode = await runSync(opts, realSyncDeps());
+    });
+
+  sync.addCommand(createSyncConfigCommand());
+
+  return sync;
+}
+
+/**
+ * `codemie analytics sync config` — flag-only settings for `sync`: webhook target,
+ * include-external policy, lookback window and the identity email. Never prompts. Values
+ * left unset stay unchanged; an invalid value saves nothing and exits 1.
+ */
+function createSyncConfigCommand(): Command {
+  return new Command('config')
+    .description('Configure analytics sync: webhook target, include-external policy, lookback window, email')
+    .option('--webhook-url <url>', 'Webhook URL sync reports are delivered to (must be https:)')
+    .option('--include-external <mode>', 'Include external sessions: windows (default), always, or never')
+    .option('--lookback-days <n>', 'Daily sync lookback window in days, 1-30 (default 7)')
+    .option('--email <address>', 'Developer email used to identify sync uploads')
+    .action((opts: SyncConfigCliOptions) => runSyncConfig(opts));
+}
+
+async function runSyncConfig(opts: SyncConfigCliOptions): Promise<void> {
+  try {
+    const email = opts.email?.trim();
+    if (email !== undefined && !EMAIL_REGEX.test(email)) {
+      throw new SyncConfigError(`Invalid email address: ${opts.email}`);
+    }
+
+    const hasUpdate =
+      opts.webhookUrl !== undefined ||
+      opts.includeExternal !== undefined ||
+      opts.lookbackDays !== undefined ||
+      email !== undefined;
+
+    if (!hasUpdate) {
+      const { loadSyncConfig } = await import('./sync/config-store.js');
+      const { redactSecrets } = await import('./sync/redact.js');
+      const cfg = await loadSyncConfig();
+      console.log('Current sync config:');
+      console.log(
+        `  webhook:          ${cfg.targets.webhook ? redactSecrets(cfg.targets.webhook.url) : '(not configured)'}`
+      );
+      console.log(`  include-external: ${cfg.includeExternal}`);
+      console.log(`  lookback-days:    ${cfg.lookbackDays}`);
+      console.log(
+        chalk.dim(
+          '\nSet a value: codemie analytics sync config --webhook-url <url> | --include-external <windows|always|never> | --lookback-days <1-30> | --email <address>'
+        )
+      );
+      return;
+    }
+
+    const { applySyncUpdate } = await import('./sync/config-store.js');
+    const update: SyncConfigUpdate = {
+      webhookUrl: opts.webhookUrl,
+      includeExternal: opts.includeExternal,
+      lookbackDays: opts.lookbackDays,
+    };
+    await applySyncUpdate(update);
+
+    if (email !== undefined) {
+      await ConfigLoader.saveUserEmail(email);
+    }
+
+    console.log(chalk.green('\n✓ Sync settings updated.'));
+  } catch (error) {
+    if (error instanceof CodeMieError) {
+      const { redactSecrets } = await import('./sync/redact.js');
+      console.error(chalk.red(`\n✗ ${redactSecrets(error.message)}`));
+      process.exitCode = 1;
+      return;
+    }
+    throw error;
+  }
 }
 
 /** Filter, report, export, and verbosity options shared by every analytics source. */
@@ -178,7 +295,7 @@ export async function runAnalytics(options: AnalyticsOptions, source: AnalyticsS
             type: 'input',
             name: 'email',
             message: 'Enter your email address:',
-            validate: (v: string) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v.trim()) || 'Please enter a valid email address',
+            validate: (v: string) => EMAIL_REGEX.test(v.trim()) || 'Please enter a valid email address',
           }]);
           userEmail = email.trim();
           await ConfigLoader.saveUserEmail(userEmail).catch(() => { /* non-fatal */ });
