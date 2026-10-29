@@ -70,6 +70,13 @@ export class SyncIdentityMissingError extends CodeMieError {
   }
 }
 
+export class SyncSchedulerUnsupportedError extends CodeMieError {
+  constructor(message: string) {
+    super(message);
+    this.name = 'SyncSchedulerUnsupportedError';
+  }
+}
+
 export class SyncDeliveryError extends CodeMieError {
   constructor(
     message: string,
