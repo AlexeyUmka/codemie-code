@@ -36,6 +36,12 @@ function makeDeps(overrides: Partial<StatusDeps> = {}): Harness {
   return { deps, printed };
 }
 
+function lineStarting(printed: string[], label: string): string {
+  const line = printed.find((l) => l.trim().startsWith(label));
+  expect(line, `no "${label}" line`).toBeDefined();
+  return line as string;
+}
+
 describe('parseLastRun', () => {
   it('returns null for an empty log', () => {
     expect(parseLastRun('')).toBeNull();
@@ -81,7 +87,7 @@ describe('parseLastRun', () => {
     expect(parseLastRun(log)).toEqual({ at: '2026-10-29T03:00:05.000Z', outcome: 'ok sent report.json 1234' });
   });
 
-  it('takes the last matching line when one is duplicated (macOS launchd stdout)', () => {
+  it('takes the last matching line when several match', () => {
     const log = [
       '2026-10-28T03:00:05.000Z ok sent report-28.json 1000',
       '2026-10-29T03:00:05.000Z ok sent report-29.json 2000',
@@ -132,7 +138,7 @@ describe('runStatus', () => {
   it('shows run time, lookback, policy, webhook host only, last run and last send when enabled', async () => {
     const { deps, printed } = makeDeps({
       readLog: async () => '2026-10-29T03:00:05.000Z ok sent report.json 1234',
-      readMarker: async () => new Date('2026-10-29T03:00:05.000Z'),
+      readMarker: async () => new Date('2026-10-28T03:00:07.000Z'),
     });
 
     const code = await runStatus(deps);
@@ -146,35 +152,57 @@ describe('runStatus', () => {
     expect(output).toContain('hooks.example.invalid');
     expect(output).not.toContain('sig=');
     expect(output).not.toContain('SUPERSECRET123');
-    expect(output).toContain('2026-10-29T03:00:05.000Z');
-    expect(output).toMatch(/sent/);
+    expect(lineStarting(printed, 'Last run:')).toMatch(/2026-10-29T03:00:05\.000Z — sent \(report\.json 1234\)/);
+    expect(lineStarting(printed, 'Last successful send:')).toMatch(/2026-10-28T03:00:07\.000Z$/);
   });
 
   it('shows "never" for the last run when the log is missing', async () => {
-    const { deps, printed } = makeDeps({ readLog: async () => null });
+    const { deps, printed } = makeDeps({
+      readLog: async () => null,
+      readMarker: async () => new Date('2026-10-28T03:00:07.000Z'),
+    });
 
     const code = await runStatus(deps);
 
     expect(code).toBe(0);
-    expect(printed.join('\n')).toMatch(/never/);
+    expect(lineStarting(printed, 'Last run:')).toMatch(/never$/);
+    expect(lineStarting(printed, 'Last successful send:')).not.toMatch(/never/);
   });
 
   it('shows "never" for the last run when the log has no matching line', async () => {
-    const { deps, printed } = makeDeps({ readLog: async () => 'garbage, not a run log line' });
+    const { deps, printed } = makeDeps({
+      readLog: async () => 'garbage, not a run log line',
+      readMarker: async () => new Date('2026-10-28T03:00:07.000Z'),
+    });
 
     const code = await runStatus(deps);
 
     expect(code).toBe(0);
-    expect(printed.join('\n')).toMatch(/never/);
+    expect(lineStarting(printed, 'Last run:')).toMatch(/never$/);
   });
 
   it('shows "never" for the last successful send when the marker is absent', async () => {
-    const { deps, printed } = makeDeps({ readMarker: async () => null });
+    const { deps, printed } = makeDeps({
+      readLog: async () => '2026-10-29T03:00:05.000Z skip no sessions in window x',
+      readMarker: async () => null,
+    });
 
     const code = await runStatus(deps);
 
     expect(code).toBe(0);
-    expect(printed.join('\n')).toMatch(/never/);
+    expect(lineStarting(printed, 'Last successful send:')).toMatch(/never$/);
+    expect(lineStarting(printed, 'Last run:')).not.toMatch(/never/);
+  });
+
+  it('reports an unreadable marker instead of rejecting', async () => {
+    const { deps, printed } = makeDeps({
+      readMarker: async () => {
+        throw Object.assign(new Error('EACCES: analytics-last-sent'), { code: 'EACCES' });
+      },
+    });
+
+    await expect(runStatus(deps)).resolves.toBe(0);
+    expect(lineStarting(printed, 'Last successful send:')).toMatch(/unknown \(EACCES: analytics-last-sent\)/);
   });
 
   it('shows the explicit lookback (not "default") when it was set', async () => {

@@ -64,11 +64,33 @@ function programArguments(cmd: JobCommand): string[] {
   return [cmd.node, cmd.entry, ...cmd.args];
 }
 
+/** Quote one systemd `ExecStart=` argument. Inside double quotes systemd still expands `%`
+ * specifiers, `$` variables and C-style backslash escapes, so each is escaped literally. */
+function systemdQuote(value: string): string {
+  const escaped = value
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"')
+    .replace(/%/g, '%%')
+    .replace(/\$/g, () => '$$');
+  return `"${escaped}"`;
+}
+
+/** Quote one Windows command-line argument (MSVCRT rules node uses to split `<Arguments>`):
+ * wrap in quotes when it holds whitespace or a quote (or `always`), double the backslashes
+ * that precede a quote or the closing quote, and escape embedded quotes. */
+function windowsQuote(value: string, always = false): string {
+  if (!always && value !== '' && !/[\s"]/.test(value)) {
+    return value;
+  }
+  const escaped = value.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\+)$/, '$1$1');
+  return `"${escaped}"`;
+}
+
 /**
  * macOS launchd plist: `StartCalendarInterval` from `at` (`HH:MM`), `RunAtLoad=false` (the
  * job only ever runs on its daily schedule, never at login/registration), stdout/stderr
- * pointed at `logPath` (the sync log, so the job's own output lands next to the run log
- * instead of /dev/null).
+ * pointed at `logPath` — a launchd-only log, never the run log: `run` already appends its
+ * own outcome line there, so sharing it would write every line twice.
  */
 export function launchdPlist(cmd: JobCommand, at: string, logPath: string): string {
   const { hour, minute } = parseAt(at);
@@ -111,9 +133,7 @@ ${args}
  * across machines that share the same `at`).
  */
 export function systemdUnits(cmd: JobCommand, at: string): { service: string; timer: string } {
-  const execStart = programArguments(cmd)
-    .map((value) => `"${value.replace(/"/g, '\\"')}"`)
-    .join(' ');
+  const execStart = programArguments(cmd).map((value) => systemdQuote(value)).join(' ');
 
   const service = `[Unit]
 Description=CodeMie analytics sync (daily)
@@ -141,9 +161,11 @@ WantedBy=timers.target
 /**
  * Windows Task Scheduler XML for `schtasks /Create /XML`. `StartWhenAvailable` (fires once
  * the machine is next available if it missed `at`); `IgnoreNew` (no overlapping runs);
- * `InteractiveToken`/`LeastPrivilege` (runs as the logged-in user, no elevation);
- * `ExecutionTimeLimit=PT30M` caps a stuck run. `<Command>` is the node binary path (no
- * `.cmd` shim); `<Arguments>` carries the entry script and CLI args.
+ * `InteractiveToken`/`LeastPrivilege` (runs as the logged-in user, no elevation); runs on
+ * battery too (`DisallowStartIfOnBatteries`/`StopIfGoingOnBatteries` false — the defaults
+ * would skip or kill it on an unplugged laptop); `ExecutionTimeLimit=PT30M` caps a stuck run.
+ * `<Command>` is the node binary path (no `.cmd` shim); `<Arguments>` carries the quoted entry
+ * script (a profile path may hold spaces) and the CLI args.
  *
  * The returned string is plain UTF-16 XML text; encoding it as UTF-16LE with a BOM into the
  * temp file `schtasks` reads is the caller's job (`./index.ts`), not this generator's.
@@ -152,7 +174,9 @@ export function taskSchedulerXml(cmd: JobCommand, at: string): string {
   const { hour, minute } = parseAt(at);
   const pad = (value: number): string => String(value).padStart(2, '0');
   const startBoundary = `${new Date().toISOString().slice(0, 10)}T${pad(hour)}:${pad(minute)}:00`;
-  const args = [cmd.entry, ...cmd.args].map(xmlEscape).join(' ');
+  const args = [windowsQuote(cmd.entry, true), ...cmd.args.map((arg) => windowsQuote(arg))]
+    .map(xmlEscape)
+    .join(' ');
 
   return `<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
@@ -177,6 +201,8 @@ export function taskSchedulerXml(cmd: JobCommand, at: string): string {
   <Settings>
     <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
     <StartWhenAvailable>true</StartWhenAvailable>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
     <ExecutionTimeLimit>PT30M</ExecutionTimeLimit>
   </Settings>
   <Actions Context="Author">

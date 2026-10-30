@@ -3,7 +3,7 @@
  *
  * Mirrors the `codemie_cli` and `git` tiers of
  * `src/agents/core/identity-resolver.ts` (config email first, then
- * `git config user.email`), but resolves the email only — no `user.name`
+ * `git config --global user.email`), but resolves the email only — no `user.name`
  * fallback — and throws `SyncIdentityMissingError` when neither source
  * yields one, instead of falling through to an OS-username tier.
  */
@@ -52,8 +52,10 @@ export async function resolveSyncIdentity(deps: SyncIdentityDeps): Promise<strin
 
 /**
  * Real dependencies for `resolveSyncIdentity`: the persisted CodeMie CLI
- * config email, then `git config user.email` run against the process cwd.
- * Each is best-effort — any failure (missing/unreadable config, no git,
+ * config email, then the global `git config --global user.email`. The global
+ * scope (not the process cwd's repo-local email) keeps install, run from the
+ * developer's shell, and the scheduled job — which has no working directory —
+ * resolving the same email. Each is best-effort — any failure (missing/unreadable config, no git,
  * non-git directory) resolves to `undefined` rather than throwing.
  */
 export const realIdentityDeps: SyncIdentityDeps = {
@@ -69,7 +71,7 @@ export const realIdentityDeps: SyncIdentityDeps = {
   async gitEmail(): Promise<string | undefined> {
     try {
       const { exec } = await import('@/utils/exec.js');
-      const result = await exec('git', ['config', 'user.email']);
+      const result = await exec('git', ['config', '--global', 'user.email']);
       if (result.code === 0) {
         return result.stdout;
       }

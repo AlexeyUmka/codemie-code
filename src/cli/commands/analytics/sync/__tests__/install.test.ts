@@ -140,6 +140,65 @@ describe('runInstall', () => {
     expect(deleteSettings).toHaveBeenCalledTimes(1);
   });
 
+  it('removes the half-registered job files when register throws', async () => {
+    const scheduler = makeScheduler({
+      register: vi.fn(async () => {
+        throw new Error('systemctl --user enable --now failed: boom');
+      }),
+    });
+    const { deps } = makeDeps({ scheduler });
+
+    const code = await runInstall(VALID_OPTS, deps);
+
+    expect(code).toBe(1);
+    // Once before register (replace any old job), once in the rollback.
+    expect(scheduler.unregister).toHaveBeenCalledTimes(2);
+  });
+
+  it('reports the register error even when the rollback itself fails', async () => {
+    const scheduler = makeScheduler({
+      register: vi.fn(async () => {
+        throw new Error('launchctl bootstrap failed: boom');
+      }),
+    });
+    const { deps, printed } = makeDeps({
+      scheduler,
+      deleteSettings: vi.fn(async () => {
+        throw new Error('EACCES: settings');
+      }),
+    });
+
+    await expect(runInstall(VALID_OPTS, deps)).resolves.toBe(1);
+    expect(printed.join('\n')).toContain('launchctl bootstrap failed: boom');
+  });
+
+  it('fails with a redacted message and registers nothing when writing settings fails', async () => {
+    const { deps, scheduler, printed } = makeDeps({
+      writeSettings: vi.fn(async () => {
+        throw new Error('ENOSPC writing settings for https://hooks.example.invalid/abc?sig=SUPERSECRET123');
+      }),
+    });
+
+    await expect(runInstall(VALID_OPTS, deps)).resolves.toBe(1);
+    expect(scheduler.register).not.toHaveBeenCalled();
+    const output = printed.join('\n');
+    expect(output).toMatch(/Install failed/);
+    expect(output).not.toContain('SUPERSECRET123');
+  });
+
+  it('fails without writing settings when removing the previous job throws', async () => {
+    const scheduler = makeScheduler({
+      unregister: vi.fn(async () => {
+        throw new Error('EACCES: LaunchAgents');
+      }),
+    });
+    const { deps, writeSettings, printed } = makeDeps({ scheduler });
+
+    await expect(runInstall(VALID_OPTS, deps)).resolves.toBe(1);
+    expect(writeSettings).not.toHaveBeenCalled();
+    expect(printed.join('\n')).toMatch(/Install failed: EACCES: LaunchAgents/);
+  });
+
   it('says the standalone collector job was taken over and its folder can be deleted, without touching the marker', async () => {
     const { deps, printed } = makeDeps({ collectorDirExists: () => true });
 

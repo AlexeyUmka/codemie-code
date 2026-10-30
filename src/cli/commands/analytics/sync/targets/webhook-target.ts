@@ -4,7 +4,8 @@
  * POSTs the analytics export as a single JSON attachment to a configured HTTPS webhook URL —
  * the one target `codemie analytics sync` ships to (no per-target grouping, no retry). Any 2xx
  * response resolves; a response above {@link MAX_EXPORT_BYTES} throws `ExportTooLargeError`
- * before any network call; a redirect response or a non-2xx response or a `fetchImpl`
+ * before any network call; a POST that takes longer than {@link WEBHOOK_TIMEOUT_MS} is aborted;
+ * a redirect response or a non-2xx response or a `fetchImpl`
  * rejection becomes a `SyncDeliveryError` with a redacted message (the signed URL query
  * parameter must never leak into it).
  *
@@ -18,6 +19,17 @@ import { errorMessage } from '../redact.js';
 import type { SyncReport } from '../types.js';
 
 export const MAX_EXPORT_BYTES = 70_000_000;
+
+/** Upper bound on one POST, so a webhook that accepts the connection but never answers cannot
+ * keep the daily job (systemd oneshot / launchd, both without their own limit) running. */
+export const WEBHOOK_TIMEOUT_MS = 5 * 60_000;
+
+function deliveryFailureMessage(err: unknown): string {
+  if (err instanceof Error && err.name === 'TimeoutError') {
+    return `Webhook did not respond within ${WEBHOOK_TIMEOUT_MS / 60_000} minutes`;
+  }
+  return errorMessage(err);
+}
 
 const defaultFetch: typeof fetch = (...args: Parameters<typeof fetch>) => fetch(...args);
 
@@ -53,9 +65,10 @@ export class WebhookTarget {
         headers: { 'content-type': 'application/json' },
         body,
         redirect: 'error',
+        signal: AbortSignal.timeout(WEBHOOK_TIMEOUT_MS),
       });
     } catch (err) {
-      throw new SyncDeliveryError(errorMessage(err));
+      throw new SyncDeliveryError(deliveryFailureMessage(err));
     }
 
     if (!response.ok) {

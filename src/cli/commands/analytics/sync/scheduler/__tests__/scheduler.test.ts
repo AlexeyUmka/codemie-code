@@ -1,8 +1,9 @@
 import { join } from 'path';
 import { describe, expect, it } from 'vitest';
 
-import { SyncSchedulerUnsupportedError } from '@/utils/errors.js';
+import { SyncSchedulerRegisterError, SyncSchedulerUnsupportedError } from '@/utils/errors.js';
 import type { ExecResult, exec as realExec } from '@/utils/exec.js';
+import { getCodemiePath } from '@/utils/paths.js';
 
 import { createScheduler, type SchedulerDeps, type SchedulerFs } from '../index.js';
 import { LAUNCHD_LABEL, SYSTEMD_UNIT_NAME, WINDOWS_TASK_NAME, type JobCommand } from '../generators.js';
@@ -31,19 +32,36 @@ function fakeExec(responses: Array<ExecResult | Error>): { exec: typeof realExec
   return { exec, calls };
 }
 
-function fakeFs(): SchedulerFs & { writes: { path: string; data: string | Buffer }[]; removed: string[] } {
+type FakeFs = SchedulerFs & {
+  writes: { path: string; data: string | Buffer }[];
+  removed: string[];
+  mkdirs: string[];
+};
+
+/** `present` lists the files that exist: `rm` of anything else rejects with ENOENT, as the
+ * real `fs.rm` does without `force`. */
+function fakeFs(present: string[] = []): FakeFs {
   const writes: { path: string; data: string | Buffer }[] = [];
   const removed: string[] = [];
+  const mkdirs: string[] = [];
+  const existing = new Set(present);
   return {
     writes,
     removed,
-    async mkdir() {
+    mkdirs,
+    async mkdir(path: string) {
+      mkdirs.push(path);
       return undefined;
     },
     async writeFile(path: string, data: string | Buffer) {
       writes.push({ path, data });
+      existing.add(path);
     },
     async rm(path: string) {
+      if (!existing.has(path)) {
+        throw Object.assign(new Error(`ENOENT: ${path}`), { code: 'ENOENT' });
+      }
+      existing.delete(path);
       removed.push(path);
     }
   };
@@ -60,12 +78,18 @@ function baseDeps(
     homedir: () => '/home/dev',
     uid: () => 501,
     username: () => 'dev',
+    sleep: async () => undefined,
     fs
   };
 }
 
 const OK: ExecResult = { code: 0, stdout: '', stderr: '' };
 const FAIL: ExecResult = { code: 1, stdout: '', stderr: 'boom' };
+
+const PLIST_PATH = join('/home/dev', 'Library', 'LaunchAgents', `${LAUNCHD_LABEL}.plist`);
+const UNIT_DIR = join('/home/dev', '.config', 'systemd', 'user');
+const SERVICE_PATH = join(UNIT_DIR, `${SYSTEMD_UNIT_NAME}.service`);
+const TIMER_PATH = join(UNIT_DIR, `${SYSTEMD_UNIT_NAME}.timer`);
 
 describe('preflight', () => {
   it('throws SyncSchedulerUnsupportedError for an unsupported platform, calling exec nothing', async () => {
@@ -136,11 +160,38 @@ describe('register on darwin', () => {
     ]);
   });
 
-  it('throws when bootstrap fails', async () => {
-    const { exec } = fakeExec([FAIL, FAIL]);
+  it('throws SyncSchedulerRegisterError when bootstrap fails twice', async () => {
+    const { exec, calls } = fakeExec([FAIL, FAIL, FAIL]);
     const scheduler = createScheduler(baseDeps('darwin', exec, fakeFs()));
 
-    await expect(scheduler.register(CMD, '07:05')).rejects.toThrow();
+    await expect(scheduler.register(CMD, '07:05')).rejects.toThrow(SyncSchedulerRegisterError);
+    expect(calls.filter((c) => c.args[0] === 'bootstrap')).toHaveLength(2);
+  });
+
+  it('retries bootstrap once after the asynchronous bootout (error 5) and succeeds', async () => {
+    const busy: ExecResult = { code: 5, stdout: '', stderr: 'Bootstrap failed: 5: Input/output error' };
+    const { exec, calls } = fakeExec([OK, busy, OK]);
+    const sleeps: number[] = [];
+    const deps = { ...baseDeps('darwin', exec, fakeFs()), sleep: async (ms: number) => void sleeps.push(ms) };
+    const scheduler = createScheduler(deps);
+
+    await expect(scheduler.register(CMD, '07:05')).resolves.toEqual({});
+    expect(calls.filter((c) => c.args[0] === 'bootstrap')).toHaveLength(2);
+    expect(sleeps).toHaveLength(1);
+  });
+
+  it('points launchd stdout/stderr at its own log, not the run log, and creates the logs dir', async () => {
+    const { exec } = fakeExec([OK, OK]);
+    const fs = fakeFs();
+    const scheduler = createScheduler(baseDeps('darwin', exec, fs));
+
+    await scheduler.register(CMD, '07:05');
+
+    const plist = String(fs.writes.find((w) => w.path === PLIST_PATH)?.data);
+    const launchdLog = getCodemiePath('logs', 'analytics-sync.launchd.log');
+    expect(plist).toContain(`<string>${launchdLog}</string>`);
+    expect(plist).not.toContain(`<string>${getCodemiePath('logs', 'analytics-sync.log')}</string>`);
+    expect(fs.mkdirs).toContain(getCodemiePath('logs'));
   });
 });
 
@@ -186,12 +237,19 @@ describe('register on linux', () => {
     expect(result.lingerWarning).toBeDefined();
   });
 
-  it('throws when daemon-reload fails, without calling enable --now', async () => {
+  it('throws SyncSchedulerRegisterError when daemon-reload fails, without calling enable --now', async () => {
     const { exec, calls } = fakeExec([FAIL]);
     const scheduler = createScheduler(baseDeps('linux', exec, fakeFs()));
 
-    await expect(scheduler.register(CMD, '07:05')).rejects.toThrow();
+    await expect(scheduler.register(CMD, '07:05')).rejects.toThrow(SyncSchedulerRegisterError);
     expect(calls).toHaveLength(1);
+  });
+
+  it('throws SyncSchedulerRegisterError when enable --now fails', async () => {
+    const { exec } = fakeExec([OK, FAIL]);
+    const scheduler = createScheduler(baseDeps('linux', exec, fakeFs()));
+
+    await expect(scheduler.register(CMD, '07:05')).rejects.toThrow(SyncSchedulerRegisterError);
   });
 });
 
@@ -214,11 +272,11 @@ describe('register on win32', () => {
     expect(calls[1].args).toContain(WINDOWS_TASK_NAME);
   });
 
-  it('throws when /Create /XML fails', async () => {
+  it('throws SyncSchedulerRegisterError when /Create /XML fails', async () => {
     const { exec } = fakeExec([FAIL, FAIL]);
     const scheduler = createScheduler(baseDeps('win32', exec, fakeFs()));
 
-    await expect(scheduler.register(CMD, '07:05')).rejects.toThrow();
+    await expect(scheduler.register(CMD, '07:05')).rejects.toThrow(SyncSchedulerRegisterError);
   });
 });
 
@@ -267,49 +325,70 @@ describe('query', () => {
 });
 
 describe('unregister', () => {
-  it('returns true, removes the job and its files, when something was registered', async () => {
-    const { exec, calls } = fakeExec([OK, OK]); // query (print) -> enabled, then bootout
-    const fs = fakeFs();
+  it('darwin: boots the job out and removes the plist, returning true', async () => {
+    const { exec, calls } = fakeExec([OK]);
+    const fs = fakeFs([PLIST_PATH]);
     const scheduler = createScheduler(baseDeps('darwin', exec, fs));
 
     const removed = await scheduler.unregister();
 
     expect(removed).toBe(true);
-    expect(calls[0]).toEqual({ command: 'launchctl', args: ['print', `gui/501/${LAUNCHD_LABEL}`] });
-    expect(fs.removed).toContain(join('/home/dev', 'Library', 'LaunchAgents', `${LAUNCHD_LABEL}.plist`));
+    expect(calls).toEqual([{ command: 'launchctl', args: ['bootout', `gui/501/${LAUNCHD_LABEL}`] }]);
+    expect(fs.removed).toContain(PLIST_PATH);
   });
 
-  it('returns false and tolerates absence when nothing was registered', async () => {
-    const { exec } = fakeExec([new Error('not found')]); // query -> disabled
-    const fs = fakeFs();
+  it('darwin: removes a plist that is not loaded and still reports it removed', async () => {
+    const { exec } = fakeExec([FAIL]);
+    const fs = fakeFs([PLIST_PATH]);
     const scheduler = createScheduler(baseDeps('darwin', exec, fs));
 
-    const removed = await scheduler.unregister();
-
-    expect(removed).toBe(false);
+    await expect(scheduler.unregister()).resolves.toBe(true);
+    expect(fs.removed).toContain(PLIST_PATH);
   });
 
-  it('on linux, removes both unit files when registered', async () => {
-    const { exec } = fakeExec([{ code: 0, stdout: 'enabled', stderr: '' }, OK]);
-    const fs = fakeFs();
+  it('darwin: returns false and tolerates absence when nothing was registered', async () => {
+    const { exec } = fakeExec([new Error('not found')]);
+    const scheduler = createScheduler(baseDeps('darwin', exec, fakeFs()));
+
+    await expect(scheduler.unregister()).resolves.toBe(false);
+  });
+
+  it('linux: disables a timer that is already disabled, removes both units and reloads systemd', async () => {
+    const { exec, calls } = fakeExec([OK, OK]);
+    const fs = fakeFs([SERVICE_PATH, TIMER_PATH]);
     const scheduler = createScheduler(baseDeps('linux', exec, fs));
 
     const removed = await scheduler.unregister();
 
     expect(removed).toBe(true);
-    const unitDir = join('/home/dev', '.config', 'systemd', 'user');
-    expect(fs.removed).toEqual(
-      expect.arrayContaining([join(unitDir, `${SYSTEMD_UNIT_NAME}.service`), join(unitDir, `${SYSTEMD_UNIT_NAME}.timer`)])
-    );
+    expect(calls).toEqual([
+      { command: 'systemctl', args: ['--user', 'disable', '--now', `${SYSTEMD_UNIT_NAME}.timer`] },
+      { command: 'systemctl', args: ['--user', 'daemon-reload'] }
+    ]);
+    expect(fs.removed).toEqual(expect.arrayContaining([SERVICE_PATH, TIMER_PATH]));
   });
 
-  it('on win32, calls schtasks /Delete /F when registered', async () => {
-    const { exec, calls } = fakeExec([OK, OK]);
+  it('linux: returns false when no unit exists', async () => {
+    const { exec } = fakeExec([FAIL]);
+    const scheduler = createScheduler(baseDeps('linux', exec, fakeFs()));
+
+    await expect(scheduler.unregister()).resolves.toBe(false);
+  });
+
+  it('win32: deletes a task disabled outside the CLI and reports it removed', async () => {
+    const { exec, calls } = fakeExec([OK]);
     const scheduler = createScheduler(baseDeps('win32', exec, fakeFs()));
 
     const removed = await scheduler.unregister();
 
     expect(removed).toBe(true);
-    expect(calls[1]).toEqual({ command: 'schtasks', args: ['/Delete', '/F', '/TN', WINDOWS_TASK_NAME] });
+    expect(calls).toEqual([{ command: 'schtasks', args: ['/Delete', '/F', '/TN', WINDOWS_TASK_NAME] }]);
+  });
+
+  it('win32: returns false when no task exists', async () => {
+    const { exec } = fakeExec([FAIL]);
+    const scheduler = createScheduler(baseDeps('win32', exec, fakeFs()));
+
+    await expect(scheduler.unregister()).resolves.toBe(false);
   });
 });

@@ -115,7 +115,7 @@ function createSyncStatusCommand(): Command {
  * `run` without it. */
 function createSyncRunCommand(): Command {
   return new Command('run')
-    .description('Send the pending analytics report to the webhook now')
+    .description('Developer or the daily scheduled job: send the pending analytics report to the webhook now')
     .addOption(new Option('--scheduled').hideHelp())
     .action(async () => {
       const { runSync, realSyncDeps } = await import('./sync/run-sync.js');

@@ -32,7 +32,7 @@ export interface InstallDeps {
   scheduler: Scheduler;
   writeSettings(settings: SyncSettings): Promise<void>;
   deleteSettings(): Promise<boolean>;
-  /** Config email, then `git config user.email` (`./identity.ts`); throws
+  /** Config email, then `git config --global user.email` (`./identity.ts`); throws
    * `SyncIdentityMissingError` when neither resolves. */
   resolveIdentity(): Promise<string>;
   isTTY: boolean;
@@ -96,56 +96,83 @@ async function resolveInstallEmail(deps: InstallDeps): Promise<string | null> {
   }
 }
 
-export async function runInstall(opts: InstallOptions, deps: InstallDeps): Promise<number> {
-  let settings: SyncSettings;
-  try {
-    settings = validateInstallOptions(opts);
-  } catch (err) {
-    deps.print(`Install failed: ${errorMessage(err)}`);
-    return 1;
-  }
+function printFailure(deps: InstallDeps, err: unknown): void {
+  deps.print(`Install failed: ${errorMessage(err)}`);
+}
 
+/** Validate the options and run the platform preflight; `null` (after printing why) on failure. */
+async function prepareSettings(opts: InstallOptions, deps: InstallDeps): Promise<SyncSettings | null> {
   try {
+    const settings = validateInstallOptions(opts);
     await deps.scheduler.preflight();
+    return settings;
   } catch (err) {
-    deps.print(`Install failed: ${errorMessage(err)}`);
-    return 1;
+    printFailure(deps, err);
+    return null;
   }
+}
 
-  let email: string;
+/** Resolve the report email for install; `null` (after printing why) on failure. */
+async function resolveEmailOrReport(deps: InstallDeps): Promise<string | null> {
   try {
-    const resolved = await resolveInstallEmail(deps);
-    if (resolved === null) {
+    const email = await resolveInstallEmail(deps);
+    if (email === null) {
       deps.print(
         'No email is configured for analytics sync, and no terminal is attached to ask for one.\n' +
           'Set one with `git config --global user.email <email>`, or run `codemie analytics sync install` ' +
           'again in a terminal to be prompted.\n' +
           'Nothing was registered.'
       );
-      return 1;
     }
-    email = resolved;
+    return email;
   } catch (err) {
-    deps.print(`Install failed: ${errorMessage(err)}`);
+    printFailure(deps, err);
+    return null;
+  }
+}
+
+/**
+ * Replace any existing job with a fresh one: unregister (same job identities as the standalone
+ * collector, see ./scheduler/generators.ts, so this removes either the collector's job or a
+ * previous CLI install's — tolerant of neither existing), write settings, register. A register
+ * failure rolls back both the job files written before the failing OS call and the settings,
+ * so nothing half-installed is left; a rollback failure never masks the register error.
+ * Returns `null` (after printing why) on any failure.
+ */
+async function replaceJob(deps: InstallDeps, settings: SyncSettings): Promise<RegisterResult | null> {
+  try {
+    await deps.scheduler.unregister();
+    await deps.writeSettings(settings);
+  } catch (err) {
+    printFailure(deps, err);
+    return null;
+  }
+
+  try {
+    const cmd = await deps.resolveJobCommand();
+    return await deps.scheduler.register(cmd, settings.at);
+  } catch (err) {
+    await deps.scheduler.unregister().catch(() => undefined);
+    await deps.deleteSettings().catch(() => undefined);
+    printFailure(deps, err);
+    return null;
+  }
+}
+
+export async function runInstall(opts: InstallOptions, deps: InstallDeps): Promise<number> {
+  const settings = await prepareSettings(opts, deps);
+  if (settings === null) {
+    return 1;
+  }
+
+  const email = await resolveEmailOrReport(deps);
+  if (email === null) {
     return 1;
   }
 
   const collectorPresent = deps.collectorDirExists();
-
-  // Same job identities as the standalone collector (./scheduler/generators.ts), so this
-  // removes either the collector's job or a previous CLI install's — tolerant of neither
-  // existing.
-  await deps.scheduler.unregister();
-
-  await deps.writeSettings(settings);
-
-  let registerResult: RegisterResult;
-  try {
-    const cmd = await deps.resolveJobCommand();
-    registerResult = await deps.scheduler.register(cmd, settings.at);
-  } catch (err) {
-    await deps.deleteSettings();
-    deps.print(`Install failed: ${errorMessage(err)}`);
+  const registerResult = await replaceJob(deps, settings);
+  if (registerResult === null) {
     return 1;
   }
 

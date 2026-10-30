@@ -1,9 +1,9 @@
 import { readFile } from 'fs/promises';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { SyncIdentityMissingError } from '@/utils/errors.js';
 
-import { resolveSyncIdentity } from '../identity.js';
+import { realIdentityDeps, resolveSyncIdentity } from '../identity.js';
 import { includeExternalFor } from '../policy.js';
 
 describe('resolveSyncIdentity', () => {
@@ -55,6 +55,19 @@ describe('resolveSyncIdentity', () => {
   it('never imports inquirer', async () => {
     const source = await readFile(new URL('../identity.ts', import.meta.url), 'utf-8');
     expect(source).not.toContain('inquirer');
+  });
+});
+
+describe('realIdentityDeps.gitEmail', () => {
+  it('reads the global git email, so install (any cwd) and the scheduled job agree', async () => {
+    const exec = vi.fn(async () => ({ code: 0, stdout: 'dev@example.invalid', stderr: '' }));
+    vi.doMock('@/utils/exec.js', () => ({ exec }));
+    try {
+      await expect(realIdentityDeps.gitEmail()).resolves.toBe('dev@example.invalid');
+      expect(exec).toHaveBeenCalledWith('git', ['config', '--global', 'user.email']);
+    } finally {
+      vi.doUnmock('@/utils/exec.js');
+    }
   });
 });
 

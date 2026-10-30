@@ -424,7 +424,7 @@ Validation runs before anything is written or registered: a missing/non-`https:`
 is written to settings only when given, so the default (7 days) keeps following CLI
 updates for an install that never set it.
 
-Install resolves the reporting email (saved CLI config, then `git config user.email`; in a
+Install resolves the reporting email (saved CLI config, then `git config --global user.email`; in a
 terminal with neither it prompts and saves the answer; without a terminal it fails with
 instructions and registers nothing), runs the per-platform preflight, removes any existing
 job with the same identity (the collector's or a previous CLI install's), writes the
@@ -444,15 +444,14 @@ never touches the last-sent marker.
 |---|---|---|
 | macOS | `~/Library/LaunchAgents/com.epam.codemie.analytics-sync.plist` — a launchd `LaunchAgent` (`StartCalendarInterval` from `--at`, `RunAtLoad=false`) | launchd re-runs a missed `StartCalendarInterval` fire once the Mac wakes |
 | Linux | `~/.config/systemd/user/codemie-analytics-sync.{service,timer}` — a systemd user timer (`Type=oneshot`, `OnCalendar=*-*-* HH:MM:00`, `Persistent=true`, `RandomizedDelaySec=300`) | `Persistent=true` fires the missed run once the user session is next active; install also runs `loginctl enable-linger $USER` so the timer fires even while the user is logged out |
-| Windows | Task Scheduler task `CodeMie Analytics Sync` (UTF-16LE+BOM XML, `StartWhenAvailable`, `IgnoreNew`, runs as the logged-in user at `InteractiveToken`/`LeastPrivilege`, `ExecutionTimeLimit PT30M`) | `StartWhenAvailable` fires the missed run once the machine is next on |
+| Windows | Task Scheduler task `CodeMie Analytics Sync` (UTF-16LE+BOM XML, `StartWhenAvailable`, `IgnoreNew`, runs as the logged-in user at `InteractiveToken`/`LeastPrivilege`, runs on battery, `ExecutionTimeLimit PT30M`) | `StartWhenAvailable` fires the missed run once the machine is next on |
 
 Installing replaces an existing job with the same identity: macOS `launchctl bootout` then
 `bootstrap gui/<uid>`; Linux `systemctl --user daemon-reload` then `enable --now`; Windows
 `schtasks /Delete /F` then `/Create /XML`. A Linux machine without a reachable
 `systemctl --user` (e.g. a non-interactive SSH session with no user D-Bus), or any other
 unsupported platform, fails install before anything is written. If `loginctl enable-linger`
-fails, the job is still registered and the failure is only a warning in the install summary
-and in `sync status`.
+fails, the job is still registered and the failure is only a warning in the install summary.
 
 The job always invokes `<node> <realpath of the CLI entry script> analytics sync run
 --scheduled` — the absolute `process.execPath` and the realpath of the running entry
@@ -527,6 +526,7 @@ All paths resolve via `getCodemiePath()` under `~/.codemie`:
 | Settings (webhook, run time, lookback, policy) | `analytics-sync.json` (mode `600`, re-applied on every write) |
 | Last-sent marker | `analytics-last-sent` (ISO timestamp; a collector-written marker is honoured as-is) |
 | Run log | `logs/analytics-sync.log` (log directory mode `700`, log file mode `600`) |
+| macOS launchd stdout/stderr | `logs/analytics-sync.launchd.log` (kept apart from the run log so each run writes its outcome line once) |
 
 There are no `ANALYTICS_*` environment-variable overrides for any of this. The webhook URL
 lives only in the `600` settings file, never in `CredentialStore` — the unattended job must

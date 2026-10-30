@@ -15,7 +15,8 @@
  * resolvable identity, and any other precondition error -> `setup`; a report-build failure or
  * an `ExportTooLargeError` (its message carries the byte count) -> `export`; any other webhook
  * delivery failure -> `send`. The marker only moves (to the run's `now()`) after delivery
- * resolves — never on `skip` or `fail`.
+ * resolves — never on `skip` or `fail`. A marker write that fails after delivery keeps the
+ * `ok sent` outcome (exit 0) with a warning suffix; a run-log append that fails is ignored.
  */
 import { appendFile, chmod, mkdir } from 'fs/promises';
 import { dirname } from 'path';
@@ -61,7 +62,21 @@ export function formatLogLine(at: Date, outcome: Outcome, rest: string): string 
 async function emit(deps: SyncDeps, now: Date, outcome: Outcome, rest: string): Promise<void> {
   const line = formatLogLine(now, outcome, rest);
   deps.print(line);
-  await deps.appendLog(line);
+  // Best-effort: an unwritable log (permissions, full disk) must not turn the run into a
+  // rejection — the printed line still carries the outcome and the exit code is unchanged.
+  await deps.appendLog(line).catch(() => undefined);
+}
+
+/** Move the marker after a delivered report. A failure here does not undo the delivery, so it
+ * becomes a warning on the `ok sent` line (the next run re-sends this window) rather than a
+ * `fail setup`. Returns that warning suffix, or `''` when the marker was saved. */
+async function moveMarker(deps: SyncDeps, now: Date): Promise<string> {
+  try {
+    await deps.writeMarker(now);
+    return '';
+  } catch (err) {
+    return ` (warning: last-sent marker not saved, the next run re-sends this window: ${errorMessage(err)})`;
+  }
 }
 
 async function run(deps: SyncDeps, now: Date): Promise<number> {
@@ -102,8 +117,8 @@ async function run(deps: SyncDeps, now: Date): Promise<number> {
     return 1;
   }
 
-  await deps.writeMarker(now);
-  await emit(deps, now, 'ok', `sent ${report.fileName} ${report.bytes.length}`);
+  const markerWarning = await moveMarker(deps, now);
+  await emit(deps, now, 'ok', `sent ${report.fileName} ${report.bytes.length}${markerWarning}`);
   return 0;
 }
 

@@ -9,12 +9,12 @@
  * values.
  */
 
-import { join } from 'path';
+import { dirname, join } from 'path';
 import { homedir as osHomedir, tmpdir, userInfo } from 'os';
 import { mkdir, rm, writeFile } from 'fs/promises';
 
-import { exec as realExec } from '@/utils/exec.js';
-import { SyncSchedulerUnsupportedError } from '@/utils/errors.js';
+import { exec as realExec, type ExecResult } from '@/utils/exec.js';
+import { SyncSchedulerRegisterError, SyncSchedulerUnsupportedError } from '@/utils/errors.js';
 import { getCodemiePath } from '@/utils/paths.js';
 
 import {
@@ -47,6 +47,8 @@ export interface SchedulerDeps {
   /** OS username, used for `loginctl enable-linger <user>` — injected rather than read from
    * `$USER`/`os.userInfo()` directly here, so tests control it. */
   username(): string;
+  /** Waits `ms` — injected so tests do not actually wait on the launchd bootstrap retry. */
+  sleep(ms: number): Promise<void>;
   fs: SchedulerFs;
 }
 
@@ -56,11 +58,13 @@ export interface RegisterResult {
   lingerWarning?: string;
 }
 
+export type JobState = 'enabled' | 'disabled';
+
 export interface Scheduler {
   preflight(): Promise<void>;
   register(cmd: JobCommand, at: string): Promise<RegisterResult>;
   unregister(): Promise<boolean>;
-  query(): Promise<'enabled' | 'disabled'>;
+  query(): Promise<JobState>;
 }
 
 const SUPPORTED_PLATFORMS: readonly NodeJS.Platform[] = ['darwin', 'linux', 'win32'];
@@ -99,167 +103,228 @@ function errorDetail(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-export function createScheduler(deps: SchedulerDeps): Scheduler {
-  async function preflight(): Promise<void> {
-    if (!SUPPORTED_PLATFORMS.includes(deps.platform)) {
-      throw new SyncSchedulerUnsupportedError(
-        `codemie analytics sync install is not supported on platform "${deps.platform}".`
-      );
-    }
+function commandOutput(result: ExecResult): string {
+  return result.stderr || result.stdout;
+}
 
-    if (deps.platform === 'linux') {
-      try {
-        const result = await deps.exec('systemctl', ['--user', 'show-environment']);
-        if (result.code !== 0) {
-          throw new Error(result.stderr || result.stdout || `exit code ${result.code}`);
-        }
-      } catch (err) {
-        throw new SyncSchedulerUnsupportedError(
-          `systemd --user is not reachable: ${errorDetail(err)}. ` +
-            'This usually means the session has no user D-Bus/systemd (e.g. a non-interactive SSH session).'
-        );
-      }
-    }
+/** Run an OS command and report whether it exited 0; a spawn failure counts as "no". */
+async function succeeded(deps: SchedulerDeps, command: string, args: string[]): Promise<boolean> {
+  try {
+    return (await deps.exec(command, args)).code === 0;
+  } catch {
+    return false;
+  }
+}
+
+/** Remove `path`, reporting whether it existed (no `force`, so a missing file rejects). */
+async function removeFile(deps: SchedulerDeps, path: string): Promise<boolean> {
+  try {
+    await deps.fs.rm(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function unsupported(platform: NodeJS.Platform): SyncSchedulerUnsupportedError {
+  return new SyncSchedulerUnsupportedError(
+    `codemie analytics sync install is not supported on platform "${platform}".`
+  );
+}
+
+async function preflight(deps: SchedulerDeps): Promise<void> {
+  if (!SUPPORTED_PLATFORMS.includes(deps.platform)) {
+    throw unsupported(deps.platform);
+  }
+  if (deps.platform !== 'linux') {
+    return;
   }
 
-  async function registerDarwin(cmd: JobCommand, at: string): Promise<RegisterResult> {
-    const plistPath = darwinPlistPath(deps);
-    await deps.fs.mkdir(join(deps.homedir(), 'Library', 'LaunchAgents'), { recursive: true });
-    const logPath = getCodemiePath('logs/analytics-sync.log');
-    await deps.fs.writeFile(plistPath, launchdPlist(cmd, at, logPath), { encoding: 'utf-8' });
-
-    const domainTarget = darwinDomainTarget(deps);
-    // Tolerates "not loaded" (and any other failure) — a prior job may not exist.
-    await deps.exec('launchctl', ['bootout', domainTarget]).catch(() => undefined);
-
-    const bootstrap = await deps.exec('launchctl', ['bootstrap', `gui/${deps.uid()}`, plistPath]);
-    if (bootstrap.code !== 0) {
-      throw new Error(`launchctl bootstrap failed: ${bootstrap.stderr || bootstrap.stdout}`);
+  try {
+    const result = await deps.exec('systemctl', ['--user', 'show-environment']);
+    if (result.code !== 0) {
+      throw new Error(commandOutput(result) || `exit code ${result.code}`);
     }
+  } catch (err) {
+    throw new SyncSchedulerUnsupportedError(
+      `systemd --user is not reachable: ${errorDetail(err)}. ` +
+        'This usually means the session has no user D-Bus/systemd (e.g. a non-interactive SSH session).'
+    );
+  }
+}
 
-    return {};
+/** Delay before retrying `launchctl bootstrap`: `bootout` finishes asynchronously, and an
+ * immediate bootstrap of the same label can fail with "5: Input/output error". */
+const BOOTSTRAP_RETRY_DELAY_MS = 1000;
+
+async function registerDarwin(deps: SchedulerDeps, cmd: JobCommand, at: string): Promise<RegisterResult> {
+  const plistPath = darwinPlistPath(deps);
+  // launchd opens StandardOutPath itself and fails silently when its directory is missing.
+  const launchdLogPath = getCodemiePath('logs', 'analytics-sync.launchd.log');
+  await deps.fs.mkdir(dirname(launchdLogPath), { recursive: true });
+  await deps.fs.mkdir(dirname(plistPath), { recursive: true });
+  await deps.fs.writeFile(plistPath, launchdPlist(cmd, at, launchdLogPath), { encoding: 'utf-8' });
+
+  // Tolerates "not loaded" (and any other failure) — a prior job may not exist.
+  await deps.exec('launchctl', ['bootout', darwinDomainTarget(deps)]).catch(() => undefined);
+
+  const bootstrapArgs = ['bootstrap', `gui/${deps.uid()}`, plistPath];
+  let bootstrap = await deps.exec('launchctl', bootstrapArgs);
+  if (bootstrap.code !== 0) {
+    await deps.sleep(BOOTSTRAP_RETRY_DELAY_MS);
+    bootstrap = await deps.exec('launchctl', bootstrapArgs);
+  }
+  if (bootstrap.code !== 0) {
+    const output = commandOutput(bootstrap);
+    throw new SyncSchedulerRegisterError(`launchctl bootstrap failed: ${output}`, output);
   }
 
-  async function registerLinux(cmd: JobCommand, at: string): Promise<RegisterResult> {
-    const unitDir = linuxUnitDir(deps);
-    await deps.fs.mkdir(unitDir, { recursive: true });
-    const { service, timer } = systemdUnits(cmd, at);
-    await deps.fs.writeFile(linuxServicePath(deps), service, { encoding: 'utf-8' });
-    await deps.fs.writeFile(linuxTimerPath(deps), timer, { encoding: 'utf-8' });
+  return {};
+}
 
-    const daemonReload = await deps.exec('systemctl', ['--user', 'daemon-reload']);
-    if (daemonReload.code !== 0) {
-      throw new Error(`systemctl --user daemon-reload failed: ${daemonReload.stderr || daemonReload.stdout}`);
-    }
+async function enableLinger(deps: SchedulerDeps): Promise<RegisterResult> {
+  try {
+    const linger = await deps.exec('loginctl', ['enable-linger', deps.username()]);
+    return linger.code === 0 ? {} : { lingerWarning: `loginctl enable-linger failed: ${commandOutput(linger)}` };
+  } catch (err) {
+    return { lingerWarning: `loginctl enable-linger failed: ${errorDetail(err)}` };
+  }
+}
 
-    const enableNow = await deps.exec('systemctl', ['--user', 'enable', '--now', linuxTimerUnit()]);
-    if (enableNow.code !== 0) {
-      throw new Error(`systemctl --user enable --now failed: ${enableNow.stderr || enableNow.stdout}`);
-    }
+async function registerLinux(deps: SchedulerDeps, cmd: JobCommand, at: string): Promise<RegisterResult> {
+  await deps.fs.mkdir(linuxUnitDir(deps), { recursive: true });
+  const { service, timer } = systemdUnits(cmd, at);
+  await deps.fs.writeFile(linuxServicePath(deps), service, { encoding: 'utf-8' });
+  await deps.fs.writeFile(linuxTimerPath(deps), timer, { encoding: 'utf-8' });
 
-    const result: RegisterResult = {};
-    try {
-      const linger = await deps.exec('loginctl', ['enable-linger', deps.username()]);
-      if (linger.code !== 0) {
-        result.lingerWarning = `loginctl enable-linger failed: ${linger.stderr || linger.stdout}`;
-      }
-    } catch (err) {
-      result.lingerWarning = `loginctl enable-linger failed: ${errorDetail(err)}`;
-    }
-
-    return result;
+  const daemonReload = await deps.exec('systemctl', ['--user', 'daemon-reload']);
+  if (daemonReload.code !== 0) {
+    const output = commandOutput(daemonReload);
+    throw new SyncSchedulerRegisterError(`systemctl --user daemon-reload failed: ${output}`, output);
   }
 
-  async function registerWindows(cmd: JobCommand, at: string): Promise<RegisterResult> {
-    const xmlPath = windowsTaskXmlPath();
-    const xml = taskSchedulerXml(cmd, at);
-    const withBom = Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(xml, 'utf16le')]);
-    await deps.fs.writeFile(xmlPath, withBom);
-
-    // Tolerates the task not existing yet.
-    await deps.exec('schtasks', ['/Delete', '/F', '/TN', WINDOWS_TASK_NAME]).catch(() => undefined);
-
-    const create = await deps.exec('schtasks', ['/Create', '/XML', xmlPath, '/TN', WINDOWS_TASK_NAME, '/F']);
-    if (create.code !== 0) {
-      throw new Error(`schtasks /Create failed: ${create.stderr || create.stdout}`);
-    }
-
-    return {};
+  const enableNow = await deps.exec('systemctl', ['--user', 'enable', '--now', linuxTimerUnit()]);
+  if (enableNow.code !== 0) {
+    const output = commandOutput(enableNow);
+    throw new SyncSchedulerRegisterError(`systemctl --user enable --now failed: ${output}`, output);
   }
 
-  async function register(cmd: JobCommand, at: string): Promise<RegisterResult> {
-    switch (deps.platform) {
-      case 'darwin':
-        return registerDarwin(cmd, at);
-      case 'linux':
-        return registerLinux(cmd, at);
-      case 'win32':
-        return registerWindows(cmd, at);
-      default:
-        throw new SyncSchedulerUnsupportedError(
-          `codemie analytics sync install is not supported on platform "${deps.platform}".`
-        );
-    }
+  return enableLinger(deps);
+}
+
+async function registerWindows(deps: SchedulerDeps, cmd: JobCommand, at: string): Promise<RegisterResult> {
+  const xmlPath = windowsTaskXmlPath();
+  const xml = taskSchedulerXml(cmd, at);
+  const withBom = Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(xml, 'utf16le')]);
+  await deps.fs.writeFile(xmlPath, withBom);
+
+  // Tolerates the task not existing yet.
+  await deps.exec('schtasks', ['/Delete', '/F', '/TN', WINDOWS_TASK_NAME]).catch(() => undefined);
+
+  const create = await deps.exec('schtasks', ['/Create', '/XML', xmlPath, '/TN', WINDOWS_TASK_NAME, '/F']);
+  if (create.code !== 0) {
+    const output = commandOutput(create);
+    throw new SyncSchedulerRegisterError(`schtasks /Create failed: ${output}`, output);
   }
 
-  async function query(): Promise<'enabled' | 'disabled'> {
-    if (deps.platform === 'darwin') {
-      try {
-        const result = await deps.exec('launchctl', ['print', darwinDomainTarget(deps)]);
-        return result.code === 0 ? 'enabled' : 'disabled';
-      } catch {
-        return 'disabled';
-      }
-    }
+  return {};
+}
 
-    if (deps.platform === 'linux') {
-      try {
-        const result = await deps.exec('systemctl', ['--user', 'is-enabled', linuxTimerUnit()]);
-        return result.stdout.trim() === 'enabled' ? 'enabled' : 'disabled';
-      } catch {
-        return 'disabled';
-      }
-    }
+async function register(deps: SchedulerDeps, cmd: JobCommand, at: string): Promise<RegisterResult> {
+  switch (deps.platform) {
+    case 'darwin':
+      return registerDarwin(deps, cmd, at);
+    case 'linux':
+      return registerLinux(deps, cmd, at);
+    case 'win32':
+      return registerWindows(deps, cmd, at);
+    default:
+      throw unsupported(deps.platform);
+  }
+}
 
-    if (deps.platform === 'win32') {
-      try {
-        const result = await deps.exec('schtasks', ['/Query', '/TN', WINDOWS_TASK_NAME, '/FO', 'LIST', '/V']);
-        if (result.code !== 0) {
-          return 'disabled';
-        }
-        return /Status:\s*Disabled/i.test(result.stdout) ? 'disabled' : 'enabled';
-      } catch {
-        return 'disabled';
-      }
-    }
+async function queryDarwin(deps: SchedulerDeps): Promise<JobState> {
+  return (await succeeded(deps, 'launchctl', ['print', darwinDomainTarget(deps)])) ? 'enabled' : 'disabled';
+}
 
+async function queryLinux(deps: SchedulerDeps): Promise<JobState> {
+  try {
+    const result = await deps.exec('systemctl', ['--user', 'is-enabled', linuxTimerUnit()]);
+    return result.stdout.trim() === 'enabled' ? 'enabled' : 'disabled';
+  } catch {
     return 'disabled';
   }
+}
 
-  async function unregister(): Promise<boolean> {
-    const before = await query();
-
-    if (deps.platform === 'darwin') {
-      if (before === 'enabled') {
-        await deps.exec('launchctl', ['bootout', darwinDomainTarget(deps)]).catch(() => undefined);
-      }
-      await deps.fs.rm(darwinPlistPath(deps), { force: true }).catch(() => undefined);
-    } else if (deps.platform === 'linux') {
-      if (before === 'enabled') {
-        await deps.exec('systemctl', ['--user', 'disable', '--now', linuxTimerUnit()]).catch(() => undefined);
-      }
-      await deps.fs.rm(linuxServicePath(deps), { force: true }).catch(() => undefined);
-      await deps.fs.rm(linuxTimerPath(deps), { force: true }).catch(() => undefined);
-    } else if (deps.platform === 'win32') {
-      if (before === 'enabled') {
-        await deps.exec('schtasks', ['/Delete', '/F', '/TN', WINDOWS_TASK_NAME]).catch(() => undefined);
-      }
+async function queryWindows(deps: SchedulerDeps): Promise<JobState> {
+  try {
+    const result = await deps.exec('schtasks', ['/Query', '/TN', WINDOWS_TASK_NAME, '/FO', 'LIST', '/V']);
+    if (result.code !== 0) {
+      return 'disabled';
     }
-
-    return before === 'enabled';
+    return /Status:\s*Disabled/i.test(result.stdout) ? 'disabled' : 'enabled';
+  } catch {
+    return 'disabled';
   }
+}
 
-  return { preflight, register, unregister, query };
+async function query(deps: SchedulerDeps): Promise<JobState> {
+  switch (deps.platform) {
+    case 'darwin':
+      return queryDarwin(deps);
+    case 'linux':
+      return queryLinux(deps);
+    case 'win32':
+      return queryWindows(deps);
+    default:
+      return 'disabled';
+  }
+}
+
+async function unregisterDarwin(deps: SchedulerDeps): Promise<boolean> {
+  const bootedOut = await succeeded(deps, 'launchctl', ['bootout', darwinDomainTarget(deps)]);
+  const plistRemoved = await removeFile(deps, darwinPlistPath(deps));
+  return bootedOut || plistRemoved;
+}
+
+async function unregisterLinux(deps: SchedulerDeps): Promise<boolean> {
+  // Disable whatever state the timer is in (enabled, or disabled outside the CLI).
+  const disabled = await succeeded(deps, 'systemctl', ['--user', 'disable', '--now', linuxTimerUnit()]);
+  const serviceRemoved = await removeFile(deps, linuxServicePath(deps));
+  const timerRemoved = await removeFile(deps, linuxTimerPath(deps));
+  if (serviceRemoved || timerRemoved) {
+    await succeeded(deps, 'systemctl', ['--user', 'daemon-reload']);
+  }
+  return disabled || serviceRemoved || timerRemoved;
+}
+
+async function unregisterWindows(deps: SchedulerDeps): Promise<boolean> {
+  // Deletes the task whether it is enabled or was disabled outside the CLI.
+  return succeeded(deps, 'schtasks', ['/Delete', '/F', '/TN', WINDOWS_TASK_NAME]);
+}
+
+/** Remove the job regardless of its enabled state; `true` when anything was actually present
+ * (a loaded/registered job or its files), `false` when there was nothing to remove. */
+async function unregister(deps: SchedulerDeps): Promise<boolean> {
+  switch (deps.platform) {
+    case 'darwin':
+      return unregisterDarwin(deps);
+    case 'linux':
+      return unregisterLinux(deps);
+    case 'win32':
+      return unregisterWindows(deps);
+    default:
+      return false;
+  }
+}
+
+export function createScheduler(deps: SchedulerDeps): Scheduler {
+  return {
+    preflight: () => preflight(deps),
+    register: (cmd: JobCommand, at: string) => register(deps, cmd, at),
+    unregister: () => unregister(deps),
+    query: () => query(deps)
+  };
 }
 
 /**
@@ -276,6 +341,7 @@ export function createRealSchedulerDeps(): SchedulerDeps {
     homedir: () => osHomedir(),
     uid: () => process.getuid?.() ?? 0,
     username: () => userInfo().username,
+    sleep: (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
     fs: { mkdir, writeFile, rm }
   };
 }

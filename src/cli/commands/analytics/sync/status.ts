@@ -52,9 +52,8 @@ export interface LastRun {
 const LAST_RUN_LINE = /^(\S+) ((?:ok sent|skip|fail \w+).*)$/;
 
 /**
- * Find the last line in `log` matching the run-log format, scanning top to bottom so a line
- * repeated later (macOS: launchd stdout targets the same file as the explicit append) wins
- * over an earlier copy. Returns `null` when no line matches.
+ * Find the last line in `log` matching the run-log format, scanning top to bottom so the
+ * latest run wins. Returns `null` when no line matches.
  */
 export function parseLastRun(log: string): LastRun | null {
   let last: LastRun | null = null;
@@ -89,6 +88,17 @@ function lastRunText(lastRun: LastRun | null): string {
   return lastRun === null ? 'never' : `${lastRun.at} — ${describeOutcome(lastRun.outcome)}`;
 }
 
+/** The "Last successful send" value: the marker time, `never`, or — when the marker cannot be
+ * read (EACCES, EISDIR) — `unknown (<redacted reason>)`, so status reports instead of rejecting. */
+async function lastSendText(deps: StatusDeps, now: Date): Promise<string> {
+  try {
+    const marker = await deps.readMarker(now);
+    return marker === null ? 'never' : marker.toISOString();
+  } catch (err) {
+    return `unknown (${errorMessage(err)})`;
+  }
+}
+
 export async function runStatus(deps: StatusDeps): Promise<number> {
   let settings: SyncSettings | null;
   try {
@@ -106,7 +116,7 @@ export async function runStatus(deps: StatusDeps): Promise<number> {
 
   const enabled = await deps.query();
   const now = deps.now();
-  const [log, marker] = await Promise.all([deps.readLog(), deps.readMarker(now)]);
+  const [log, lastSend] = await Promise.all([deps.readLog(), lastSendText(deps, now)]);
   const lastRun = log === null ? null : parseLastRun(log);
 
   deps.print(`Analytics sync: ${enabled}`);
@@ -119,7 +129,7 @@ export async function runStatus(deps: StatusDeps): Promise<number> {
   deps.print(`  Include external:      ${settings.includeExternal}`);
   deps.print(`  Webhook:               ${webhookHost(settings.webhookUrl)}`);
   deps.print(`  Last run:              ${lastRunText(lastRun)}`);
-  deps.print(`  Last successful send:  ${marker === null ? 'never' : marker.toISOString()}`);
+  deps.print(`  Last successful send:  ${lastSend}`);
 
   return 0;
 }

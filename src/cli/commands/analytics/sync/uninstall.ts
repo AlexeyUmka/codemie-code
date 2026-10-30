@@ -17,8 +17,8 @@ import { createRealSchedulerDeps, createScheduler } from './scheduler/index.js';
 /** Every side effect `runUninstall` needs, injected so tests run without a real scheduler or
  * fs. `createRealUninstallDeps()` below wires the real ones. */
 export interface UninstallDeps {
-  /** Unregisters the OS job (re-queries first; tolerant of it already being absent) and
-   * reports whether it had been registered. */
+  /** Removes the OS job whether enabled or disabled (tolerant of it already being absent)
+   * and reports whether anything was actually present. */
   unregister(): Promise<boolean>;
   /** Deletes the settings file and reports whether it existed. */
   deleteSettings(): Promise<boolean>;

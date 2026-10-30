@@ -193,6 +193,76 @@ describe('runSync', () => {
     expect(NOW.getTime() - passedWindow.from.getTime()).toBeGreaterThanOrEqual(10 * DAY_MS);
   });
 
+  it('uses the installed lookbackDays for the window when there is no marker', async () => {
+    const buildReport = vi.fn(async () => REPORT);
+    const { deps } = makeDeps({
+      loadSettings: async () => ({ ...BASE_SETTINGS, lookbackDays: 14 }),
+      buildReport,
+    });
+
+    await runSync(deps);
+
+    const passedWindow = buildReport.mock.calls[0]?.[0]?.window;
+    expect(passedWindow.from).toEqual(new Date(NOW.getTime() - 14 * DAY_MS));
+  });
+
+  it.each([
+    ['always', 'linux', true],
+    ['windows', 'linux', false],
+    ['windows', 'win32', true],
+    ['never', 'win32', false],
+  ] as const)('passes includeExternal for policy %s on %s as %s', async (policy, platform, expected) => {
+    const buildReport = vi.fn(async () => REPORT);
+    const { deps } = makeDeps({
+      loadSettings: async () => ({ ...BASE_SETTINGS, includeExternal: policy }),
+      platform,
+      buildReport,
+    });
+
+    await runSync(deps);
+
+    expect(buildReport.mock.calls[0]?.[0]?.includeExternal).toBe(expected);
+  });
+
+  it('still resolves to an exit code when the run log cannot be written', async () => {
+    const { deps, printed } = makeDeps({
+      appendLog: async () => {
+        throw new Error('EACCES: analytics-sync.log');
+      },
+    });
+
+    await expect(runSync(deps)).resolves.toBe(0);
+    expect(printed.some((line) => /ok sent/.test(line))).toBe(true);
+  });
+
+  it('still resolves to 1 when the run log cannot be written on a failure', async () => {
+    const { deps } = makeDeps({
+      loadSettings: async () => null,
+      appendLog: async () => {
+        throw new Error('ENOSPC');
+      },
+    });
+
+    await expect(runSync(deps)).resolves.toBe(1);
+  });
+
+  it('a marker write failure after a 2xx send logs one ok sent line with a warning, not fail setup', async () => {
+    const { deps, printed, logged } = makeDeps({
+      writeMarker: async () => {
+        throw new Error('EACCES: analytics-last-sent');
+      },
+    });
+
+    const code = await runSync(deps);
+
+    expect(code).toBe(0);
+    expect(logged).toHaveLength(1);
+    expect(printed).toHaveLength(1);
+    expect(logged[0]).toMatch(/ ok sent /);
+    expect(logged[0]).toMatch(/marker/);
+    expect(logged[0]).not.toMatch(/fail/);
+  });
+
   it('never throws, even when an unexpected error occurs reading settings', async () => {
     const { deps } = makeDeps({
       loadSettings: async () => {

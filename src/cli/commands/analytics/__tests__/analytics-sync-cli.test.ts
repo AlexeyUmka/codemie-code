@@ -94,6 +94,11 @@ describe('analytics sync CLI wiring — command surface', () => {
     const install = sync.commands.find((c) => c.name() === 'install')!;
     expect(install.description()).toBe('Developer: register the daily delivery job on this machine');
 
+    const run = sync.commands.find((c) => c.name() === 'run')!;
+    expect(run.description()).toBe(
+      'Developer or the daily scheduled job: send the pending analytics report to the webhook now'
+    );
+
     for (const name of ['status', 'run', 'uninstall']) {
       const sub = sync.commands.find((c) => c.name() === name)!;
       expect(sub.description().length).toBeGreaterThan(0);

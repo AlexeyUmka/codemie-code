@@ -77,6 +77,18 @@ export class SyncSchedulerUnsupportedError extends CodeMieError {
   }
 }
 
+/** An OS scheduler command (`launchctl bootstrap`, `systemctl --user ...`, `schtasks /Create`)
+ * failed while registering the analytics sync job; `output` is the command's stderr/stdout. */
+export class SyncSchedulerRegisterError extends CodeMieError {
+  constructor(
+    message: string,
+    public readonly output?: string
+  ) {
+    super(message);
+    this.name = 'SyncSchedulerRegisterError';
+  }
+}
+
 export class SyncDeliveryError extends CodeMieError {
   constructor(
     message: string,

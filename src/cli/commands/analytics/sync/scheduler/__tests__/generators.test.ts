@@ -1,6 +1,11 @@
-import { describe, expect, it } from 'vitest';
+import { mkdtemp, realpath, rm, symlink, writeFile } from 'fs/promises';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import { afterEach, describe, expect, it } from 'vitest';
 
-import { launchdPlist, systemdUnits, taskSchedulerXml, type JobCommand } from '../generators.js';
+import { isScheduledSyncRun } from '@/utils/scheduled-run.js';
+
+import { launchdPlist, resolveJobCommand, systemdUnits, taskSchedulerXml, type JobCommand } from '../generators.js';
 
 const CMD: JobCommand = {
   node: '/usr/local/bin/node',
@@ -48,6 +53,14 @@ describe('systemdUnits', () => {
   it('timer sets a RandomizedDelaySec', () => {
     expect(timer).toContain('RandomizedDelaySec=300');
   });
+
+  it('escapes backslashes, %, $ and quotes so systemd passes the paths through unchanged', () => {
+    const special = systemdUnits(
+      { node: '/opt/n%de/bin/node', entry: '/home/a$b/c\\d/"e"/codemie.js', args: ['run'] },
+      '07:05'
+    ).service;
+    expect(special).toContain('ExecStart="/opt/n%%de/bin/node" "/home/a$$b/c\\\\d/\\"e\\"/codemie.js" "run"');
+  });
 });
 
 describe('taskSchedulerXml', () => {
@@ -70,5 +83,52 @@ describe('taskSchedulerXml', () => {
 
   it('caps execution time at PT30M', () => {
     expect(xml).toContain('<ExecutionTimeLimit>PT30M</ExecutionTimeLimit>');
+  });
+
+  it('runs on battery power and is not stopped when the laptop unplugs', () => {
+    expect(xml).toContain('<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>');
+    expect(xml).toContain('<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>');
+  });
+
+  it('quotes an entry path containing spaces so node receives it as one argument', () => {
+    const winXml = taskSchedulerXml(
+      {
+        node: 'C:\\Program Files\\nodejs\\node.exe',
+        entry: 'C:\\Users\\First Last\\AppData\\Roaming\\npm\\codemie.js',
+        args: ['analytics', 'sync', 'run', '--scheduled']
+      },
+      '07:05'
+    );
+    expect(winXml).toContain(
+      '<Arguments>&quot;C:\\Users\\First Last\\AppData\\Roaming\\npm\\codemie.js&quot; analytics sync run --scheduled</Arguments>'
+    );
+  });
+});
+
+describe('resolveJobCommand', () => {
+  const originalArgv1 = process.argv[1];
+  let dir: string | undefined;
+
+  afterEach(async () => {
+    process.argv[1] = originalArgv1;
+    if (dir) {
+      await rm(dir, { recursive: true, force: true });
+      dir = undefined;
+    }
+  });
+
+  it('resolves a symlinked entry to its realpath and builds argv the startup gate recognizes', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'codemie-job-cmd-'));
+    const target = join(dir, 'codemie.js');
+    const link = join(dir, 'codemie-shim');
+    await writeFile(target, '');
+    await symlink(target, link);
+    process.argv[1] = link;
+
+    const cmd = await resolveJobCommand();
+
+    expect(cmd.node).toBe(process.execPath);
+    expect(cmd.entry).toBe(await realpath(target));
+    expect(isScheduledSyncRun([cmd.node, cmd.entry, ...cmd.args])).toBe(true);
   });
 });
