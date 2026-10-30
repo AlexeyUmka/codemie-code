@@ -651,7 +651,7 @@ In short: Codex = detect-in-stream, no retry, permanent latch for later requests
 
 **Log Destinations**: `~/.codemie/logs/debug-YYYY-MM-DD.log`
 
-**Log Level**: DEBUG (file only, console when CODEMIE_DEBUG=1)
+**Log Level**: DEBUG (file only, stderr when CODEMIE_DEBUG=1)
 
 **Lifecycle Hooks**:
 
